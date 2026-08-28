@@ -20,13 +20,15 @@ def _count_position_changes(pos: pd.Series) -> int:
 
 def _align_funding_rates(index: pd.DatetimeIndex, funding_rates: pd.Series | None) -> pd.Series:
     if funding_rates is None:
-        return pd.Series(np.nan, index=index)
+        return pd.Series(0.0, index=index)
     rates = pd.Series(funding_rates).copy()
     rates.index = pd.to_datetime(rates.index, utc=True)
     rates = pd.to_numeric(rates, errors="coerce").dropna().sort_index()
     if rates.empty:
-        return pd.Series(np.nan, index=index)
-    return rates.reindex(index, method="ffill")
+        return pd.Series(0.0, index=index)
+    # Funding is charged at the reported settlement timestamps only; do not
+    # forward-fill a rate across ordinary bars.
+    return rates.groupby(level=0).last().reindex(index).fillna(0.0)
 
 
 def run_ohlcv(
@@ -69,15 +71,12 @@ def run_ohlcv(
     trading_costs = turnover * cost_rate
     gross_strategy_ret = next_pos * effective_leverage * asset_ret
 
-    # Prefer actual historical funding-rate observations when supplied. CCXT
-    # returns fundingRate as a decimal (e.g. 0.0001 = 1 bp). A funding charge
-    # is only applied when a non-zero position is carried through the funding
-    # observation. When no history is available, fall back to the configured
-    # conservative 8-hour funding assumption.
     actual_funding = _align_funding_rates(data.index, funding_rates)
-    if market_type == "futures" and actual_funding.notna().any():
-        funding_costs = next_pos * actual_funding.fillna(0.0) * effective_leverage
+    if market_type == "futures" and funding_rates is not None and actual_funding.abs().sum() > 0:
+        funding_costs = next_pos * actual_funding * effective_leverage
     elif market_type == "futures" and funding_bps_per_8h > 0 and len(data) > 1:
+        # Fallback only when historical funding data is unavailable.
+        # The configured amount is a conservative per-8h assumption.
         median_delta = data.index.to_series().diff().dropna().median()
         hours_per_bar = max(float(median_delta.total_seconds()) / 3600.0, 1e-9)
         funding_per_bar = funding_bps_per_8h / 10_000.0 * (hours_per_bar / 8.0)
@@ -87,30 +86,23 @@ def run_ohlcv(
 
     strategy_ret = gross_strategy_ret - trading_costs - funding_costs
 
-    # Conservative liquidation guard: flag an intrabar adverse move large enough
-    # to exhaust the simplified maintenance buffer. This is deliberately a guard,
-    # not a claim to reproduce exchange liquidation engines exactly.
     liquidation_events = pd.Series(False, index=data.index)
     if market_type == "futures" and leverage > 1.0:
         prev_close = close.shift(1)
         adverse = pd.Series(0.0, index=data.index)
-        long_move = low / prev_close - 1.0
-        short_move = -(high / prev_close - 1.0)
-        adverse[next_pos > 0] = long_move[next_pos > 0]
-        adverse[next_pos < 0] = short_move[next_pos < 0]
+        adverse[next_pos > 0] = (low / prev_close - 1.0)[next_pos > 0]
+        adverse[next_pos < 0] = (-(high / prev_close - 1.0))[next_pos < 0]
         maintenance = max(0.005, min(0.10, 0.005 * leverage))
         threshold = (1.0 - maintenance) / leverage
         liquidation_events = (adverse < -threshold).fillna(False)
         if liquidation_events.any():
             first = liquidation_events[liquidation_events].index[0]
-            strategy_ret = strategy_ret.copy()
             strategy_ret.loc[first] = -0.999
-            if first != strategy_ret.index[-1]:
-                strategy_ret.loc[first < strategy_ret.index] = strategy_ret.loc[first < strategy_ret.index]
 
     equity = initial_capital * (1.0 + strategy_ret).cumprod()
     peak = equity.cummax()
-    drawdown = equity / peak - 1.0
+    drawdown = equity / peak.replace(0, np.nan) - 1.0
+    drawdown = drawdown.fillna(-1.0)
     pnl = equity.diff().fillna(0.0)
     gains = float(pnl[pnl > 0].sum())
     losses = float(-pnl[pnl < 0].sum())
@@ -127,7 +119,7 @@ def run_ohlcv(
         "short_exposure": float((next_pos < 0).mean()),
         "cost_drag": float(trading_costs.sum()),
         "funding_drag": float(funding_costs.sum()),
-        "funding_source": "historical" if actual_funding.notna().any() and market_type == "futures" else ("assumption" if market_type == "futures" else "none"),
+        "funding_source": "historical" if market_type == "futures" and funding_rates is not None and actual_funding.abs().sum() > 0 else ("assumption" if market_type == "futures" else "none"),
         "leverage": float(effective_leverage),
         "market_type": market_type,
         "liquidation_events": int(liquidation_events.sum()),
