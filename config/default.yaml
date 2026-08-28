@@ -1,0 +1,36 @@
+project:
+  name: autonomous_crypto_trading_lab
+  version: "0.1.0"
+
+capital:
+  initial_usd: 500.0
+  base_currency: USD
+
+research:
+  market: crypto
+  autonomous: true
+  internet_for_hypotheses: true
+  max_experiments_per_run: 25
+  require_independent_validation: true
+
+execution:
+  allow_spot: true
+  allow_futures: true
+  allow_long: true
+  allow_short: true
+  allow_leverage: true
+  max_leverage: 3.0
+  commission_bps: 10.0
+  slippage_bps: 5.0
+  include_funding: true
+
+validation:
+  holdout_ratio: 0.30
+  walk_forward: true
+  falsification_passes: 5
+  require_parameter_stability: true
+
+output:
+  generate_pine: true
+  generate_reports: true
+  write_experiment_ledger: true
