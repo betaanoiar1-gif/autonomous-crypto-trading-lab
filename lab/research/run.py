@@ -11,16 +11,24 @@ from .parser import parse_hypotheses
 from .prompt import build_prompt, SYSTEM as RESEARCH_SYSTEM
 from .evaluator import evaluate
 
+DIVERSITY_SLOTS = [
+    {"preferred_family": "momentum", "preferred_timeframe": "15m", "preferred_symbol": "BTC/USDT", "preferred_direction": "long"},
+    {"preferred_family": "mean_reversion", "preferred_timeframe": "1h", "preferred_symbol": "ETH/USDT", "preferred_direction": "both"},
+    {"preferred_family": "breakout", "preferred_timeframe": "4h", "preferred_symbol": "BTC/USDT", "preferred_direction": "both"},
+    {"preferred_family": "moving_average_cross", "preferred_timeframe": "1h", "preferred_symbol": "ETH/USDT", "preferred_direction": "short"},
+]
 
-def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses):
-    prompt = build_prompt(snapshot, prior_failures, 1, prior_hypotheses)
+
+def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses, slot):
+    prompt = build_prompt(snapshot, prior_failures, 1, prior_hypotheses, diversity_slot=slot)
     text = agent.chat(prompt, system=RESEARCH_SYSTEM)
     try:
         return parse_hypotheses(text)[0]
     except (ValueError, IndexError):
         retry = (
             "Return exactly ONE hypothesis block using the required line format. "
-            "End with END. No JSON, markdown, analysis, or commentary.\n\n" + prompt
+            "End with END. No JSON, markdown, analysis, or commentary. "
+            f"Follow this diversity slot where possible: {slot}\n\n" + prompt
         )
         return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))[0]
 
@@ -75,15 +83,36 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     print(f"Data source: {exchange_id} | {timeframe} | {symbols}")
     agent = agent or LocalAgent()
     hypotheses = []
-    for attempt in range(max_hypotheses):
+    target = min(max_hypotheses, len(DIVERSITY_SLOTS))
+    for attempt in range(target):
+        slot = DIVERSITY_SLOTS[attempt]
         try:
-            hypothesis = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump() for h in hypotheses])
-            signature = (hypothesis.executable_family, tuple(hypothesis.directions), tuple(hypothesis.symbols), hypothesis.thesis.strip().lower())
+            hypothesis = _safe_one_hypothesis(
+                agent,
+                snapshot,
+                prior_failures,
+                [h.model_dump() for h in hypotheses],
+                slot,
+            )
+            signature = (
+                hypothesis.executable_family,
+                tuple(hypothesis.directions),
+                tuple(hypothesis.symbols),
+                tuple(hypothesis.timeframes),
+                hypothesis.thesis.strip().lower(),
+            )
             existing = [
-                (h.executable_family, tuple(h.directions), tuple(h.symbols), h.thesis.strip().lower())
+                (
+                    h.executable_family,
+                    tuple(h.directions),
+                    tuple(h.symbols),
+                    tuple(h.timeframes),
+                    h.thesis.strip().lower(),
+                )
                 for h in hypotheses
             ]
             if signature in existing:
+                print(f"Hypothesis generation {attempt + 1}: duplicate rejected")
                 continue
             hypotheses.append(hypothesis)
         except Exception as exc:
@@ -105,7 +134,8 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
                 settings.validation.holdout_ratio,
             )
             record = {
-                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "run_id": run_id, "index": idx, "symbol": symbol,
+                "timeframe": hypothesis.timeframes[0] if hypothesis.timeframes else timeframe,
                 "hypothesis": hypothesis.model_dump(),
                 "status": "VALIDATION_CANDIDATE" if evaluation.passed else "REJECTED",
                 "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
@@ -120,7 +150,8 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
                 record["pine_path"] = str(out / f"candidate_{idx + 1}.pine")
         except Exception as exc:
             record = {
-                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "run_id": run_id, "index": idx, "symbol": symbol,
+                "timeframe": hypothesis.timeframes[0] if hypothesis.timeframes else timeframe,
                 "hypothesis": hypothesis.model_dump(), "status": "REJECTED", "error": str(exc),
             }
         records.append(record)
