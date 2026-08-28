@@ -5,22 +5,24 @@ import json
 
 from ..config import ROOT, load_settings
 from ..data.ccxt_adapter import CCXTMarketData
-from ..kimi_agent import SYSTEM_PROMPT
 from ..local_agent import LocalAgent
 from ..pine_factory import build_pine
 from .parser import parse_hypotheses
-from .prompt import build_prompt
+from .prompt import build_prompt, SYSTEM as RESEARCH_SYSTEM
 from .evaluator import evaluate
 
 
 def _safe_agent_hypotheses(agent, snapshot, max_hypotheses, prior_failures):
     prompt = build_prompt(snapshot, prior_failures, max_hypotheses)
-    text = agent.chat(prompt, system=SYSTEM_PROMPT)
+    text = agent.chat(prompt, system=RESEARCH_SYSTEM)
     try:
         return parse_hypotheses(text)
     except ValueError:
-        retry = "Return only valid JSON matching the requested schema. No markdown.\n\n" + prompt
-        return parse_hypotheses(agent.chat(retry, system=SYSTEM_PROMPT))
+        retry = (
+            "Repeat the task using the exact line format specified in the prompt. "
+            "Return only hypothesis blocks ending with END. Do not output JSON, markdown, or analysis.\n\n" + prompt
+        )
+        return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))
 
 
 def _load_failures(path):
