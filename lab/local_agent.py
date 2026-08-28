@@ -10,7 +10,9 @@ SYSTEM_PROMPT = """
 You are an autonomous quantitative crypto research scientist.
 Generate falsifiable hypotheses and useful reasoning, but never claim guaranteed profitability.
 Use information to form hypotheses; empirical validation must come from the research lab.
-Do not invent data, results or tests. Return requested structured output exactly when a schema is provided.
+Do not invent data, results or tests.
+When JSON is requested, return one compact JSON object and nothing else.
+Do not use markdown fences. Do not include a <think> section in the final answer.
 """.strip()
 
 
@@ -33,12 +35,12 @@ def choose_default_model() -> str:
 class LocalAgent:
     model_name: str | None = None
     max_new_tokens: int = 768
-    temperature: float = 0.2
+    temperature: float = 0.0
 
     def __post_init__(self) -> None:
         self.model_name = self.model_name or choose_default_model()
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+            from transformers import AutoModelForCausalLM, AutoTokenizer
             import torch
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -46,11 +48,6 @@ class LocalAgent:
                 self.model_name,
                 device_map="auto",
                 dtype=dtype,
-            )
-            self.pipe = pipeline(
-                "text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer,
             )
         except Exception as exc:
             raise RuntimeError(f"Unable to load local model {self.model_name}: {exc}") from exc
@@ -60,17 +57,34 @@ class LocalAgent:
             {"role": "system", "content": system or SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        output = self.pipe(
-            messages,
+        try:
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                return_tensors="pt",
+            )
+        except TypeError:
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+
+        input_ids = input_ids.to(self.model.device)
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+        output_ids = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
-            do_sample=self.temperature > 0,
+            do_sample=False,
+            pad_token_id=self.tokenizer.eos_token_id,
         )
-        generated = output[0]["generated_text"]
-        if isinstance(generated, list):
-            return str(generated[-1].get("content", ""))
-        return str(generated)
+        generated = output_ids[0, input_ids.shape[-1]:]
+        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
     def healthcheck(self) -> dict:
         text = self.chat("Reply with exactly: LOCAL_OK")
-        return {"ok": "LOCAL_OK" in text, "model": self.model_name}
+        return {"ok": text.strip() == "LOCAL_OK", "model": self.model_name}
