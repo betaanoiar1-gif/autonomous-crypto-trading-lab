@@ -24,33 +24,61 @@ def run_ohlcv(
     initial_capital: float,
     fee_bps: float = 10.0,
     slippage_bps: float = 5.0,
+    market_type: str = "spot",
+    leverage: float = 1.0,
+    funding_bps_per_8h: float = 0.0,
 ) -> BacktestResult:
     required = {"open", "high", "low", "close", "volume"}
     if not required.issubset(df.columns):
         raise ValueError(f"DataFrame must contain {sorted(required)} columns")
     if initial_capital <= 0:
         raise ValueError("initial_capital must be positive")
-    if fee_bps < 0 or slippage_bps < 0:
-        raise ValueError("fee_bps and slippage_bps must be non-negative")
+    if fee_bps < 0 or slippage_bps < 0 or funding_bps_per_8h < 0:
+        raise ValueError("cost parameters must be non-negative")
+    market_type = str(market_type).strip().lower()
+    if market_type not in {"spot", "futures"}:
+        raise ValueError("market_type must be 'spot' or 'futures'")
+    if leverage < 1.0 or leverage > 20.0:
+        raise ValueError("leverage must be between 1 and 20")
 
     data = df.copy().sort_index()
     close = data["close"].astype(float)
-    pos = (
-        signal.astype(float)
-        .reindex(close.index)
-        .fillna(0.0)
-        .clip(-1.0, 1.0)
-    )
+    pos = signal.astype(float).reindex(close.index).fillna(0.0).clip(-1.0, 1.0)
 
-    # Execution convention: signal formed on bar t is acted on at bar t+1.
+    # Signal on bar t is executed on bar t+1.
     next_pos = pos.shift(1).fillna(0.0)
     asset_ret = close.pct_change().fillna(0.0)
     turnover = pos.diff().abs().fillna(pos.abs())
 
-    # Fee + slippage are charged on position changes / notional turnover.
     cost_rate = (fee_bps + slippage_bps) / 10_000.0
-    costs = turnover * cost_rate
-    strategy_ret = next_pos * asset_ret - costs
+    trading_costs = turnover * cost_rate
+
+    effective_leverage = leverage if market_type == "futures" else 1.0
+    gross_strategy_ret = next_pos * effective_leverage * asset_ret
+
+    # Approximate perpetual funding: one charge per 8 hours of elapsed bars,
+    # proportional to absolute exposure. This is deliberately conservative and
+    # intended for research rather than exchange-specific settlement modeling.
+    if funding_bps_per_8h > 0 and len(data) > 1:
+        if len(data.index) >= 2:
+            median_delta = data.index.to_series().diff().dropna().median()
+            hours_per_bar = max(float(median_delta.total_seconds()) / 3600.0, 1e-9)
+        else:
+            hours_per_bar = 1.0
+        funding_per_bar = funding_bps_per_8h / 10_000.0 * (hours_per_bar / 8.0)
+        funding_costs = next_pos.abs() * funding_per_bar if market_type == "futures" else pd.Series(0.0, index=data.index)
+    else:
+        funding_costs = pd.Series(0.0, index=data.index)
+
+    strategy_ret = gross_strategy_ret - trading_costs - funding_costs
+
+    # Conservative liquidation guard for leveraged futures.
+    if market_type == "futures" and leverage > 1.0:
+        liquidation_buffer = max(0.02, 0.50 / leverage)
+        breach = strategy_ret < -liquidation_buffer
+        if breach.any():
+            strategy_ret = strategy_ret.copy()
+            strategy_ret.loc[breach] = -0.999
 
     equity = initial_capital * (1.0 + strategy_ret).cumprod()
     peak = equity.cummax()
@@ -69,7 +97,11 @@ def run_ohlcv(
         "exposure": float(next_pos.abs().mean()),
         "long_exposure": float((next_pos > 0).mean()),
         "short_exposure": float((next_pos < 0).mean()),
-        "cost_drag": float(costs.sum()),
+        "cost_drag": float(trading_costs.sum()),
+        "funding_drag": float(funding_costs.sum()),
+        "leverage": float(effective_leverage),
+        "market_type": market_type,
+        "liquidation_events": int(((strategy_ret <= -0.999) & (next_pos != 0)).sum()),
         "bars": int(len(data)),
     }
 
@@ -78,7 +110,8 @@ def run_ohlcv(
             "position": pos,
             "executed_position": next_pos,
             "turnover": turnover,
-            "cost": costs,
+            "trading_cost": trading_costs,
+            "funding_cost": funding_costs,
             "asset_return": asset_ret,
             "strategy_return": strategy_ret,
         },
