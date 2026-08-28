@@ -64,6 +64,8 @@ def _enforce_slot(hypothesis, slot):
     raw = dict(hypothesis.executable_parameters or {})
     if family in {"momentum", "breakout"}:
         params = {"lookback": _to_int(raw.get("lookback", 20), 20, 2, 200)}
+        label = "Momentum" if family == "momentum" else "Breakout"
+        title = f"{label} | lookback={params['lookback']}"
     elif family == "mean_reversion":
         z_entry = _to_float(raw.get("z_entry", 1.5), 1.5, 0.8, 3.5)
         z_exit = _to_float(raw.get("z_exit", 0.25), 0.25, 0.05, 1.5)
@@ -73,24 +75,21 @@ def _enforce_slot(hypothesis, slot):
             "z_entry": z_entry,
             "z_exit": z_exit,
         }
+        title = (
+            f"Mean Reversion | lookback={params['lookback']} | "
+            f"z_entry={params['z_entry']:.2f} | z_exit={params['z_exit']:.2f}"
+        )
     elif family == "moving_average_cross":
         fast = _to_int(raw.get("fast", 10), 10, 2, 100)
         slow = _to_int(raw.get("slow", 40), 40, 3, 300)
         slow = max(fast + 1, slow)
         params = {"fast": fast, "slow": slow}
+        title = f"Moving Average Cross | fast={fast} | slow={slow}"
     else:
-        params = raw
-    title_map = {
-        "momentum": f"Momentum | lookback={params['lookback']}",
-        "breakout": f"Breakout | lookback={params['lookback']}",
-        "mean_reversion": (
-            f"Mean Reversion | lookback={params['lookback']} | "
-            f"z_entry={params['z_entry']:.2f} | z_exit={params['z_exit']:.2f}"
-        ),
-        "moving_average_cross": f"Moving Average Cross | fast={params['fast']} | slow={params['slow']}",
-    }
+        params = {}
+        title = hypothesis.title
     return hypothesis.model_copy(update={
-        "title": title_map.get(family, hypothesis.title),
+        "title": title,
         "executable_family": family,
         "executable_parameters": params,
         "directions": [Direction(_direction_value(slot["preferred_direction"]))],
@@ -200,10 +199,7 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     for attempt in range(target):
         slot = DIVERSITY_SLOTS[attempt]
         try:
-            raw = _safe_one_hypothesis(
-                agent, snapshot, prior_failures,
-                [h.model_dump(mode="json") for h in hypotheses], slot
-            )
+            raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump(mode="json") for h in hypotheses], slot)
             h = _enforce_slot(raw, slot)
             signature = (
                 h.executable_family,
@@ -224,10 +220,7 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
             ):
                 h = h.model_copy(update={"thesis": h.thesis + f" | diversity slot {attempt + 1}"})
             hypotheses.append(h)
-            print(
-                f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | "
-                f"{h.timeframes[0]} | {_direction_value(h.directions[0])}"
-            )
+            print(f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | {h.timeframes[0]} | {_direction_value(h.directions[0])}")
         except Exception as exc:
             print(f"Hypothesis generation {attempt + 1} failed: {exc}")
 
@@ -240,47 +233,27 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         directions = [_direction_value(x) for x in h.directions]
         try:
             evaluation = evaluate(
-                df,
-                h.executable_family or "momentum",
-                h.executable_parameters,
-                directions,
-                settings.capital.initial_usd,
-                settings.execution.commission_bps,
-                settings.execution.slippage_bps,
-                settings.validation.holdout_ratio,
+                df, h.executable_family or "momentum", h.executable_parameters, directions,
+                settings.capital.initial_usd, settings.execution.commission_bps,
+                settings.execution.slippage_bps, settings.validation.holdout_ratio,
             )
             status = _status(evaluation)
             record = {
-                "run_id": run_id,
-                "index": idx,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "hypothesis": h.model_dump(mode="json"),
-                "status": status,
-                "in_sample": evaluation.in_sample,
-                "out_of_sample": evaluation.out_of_sample,
-                "robustness": evaluation.robustness,
-                "rejection_reasons": evaluation.rejection_reasons,
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"), "status": status,
+                "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
+                "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons,
             }
             if status == "VALIDATED" and settings.output.generate_pine:
-                pine = build_pine(
-                    f"ACL {h.title[:50]}",
-                    h.executable_family or "momentum",
-                    h.executable_parameters,
-                    allow_short=any(d in {"short", "both"} for d in directions),
-                )
+                pine = build_pine(f"ACL {h.title[:50]}", h.executable_family or "momentum", h.executable_parameters,
+                                  allow_short=any(d in {"short", "both"} for d in directions))
                 path = out / f"validated_candidate_{idx + 1}.pine"
                 path.write_text(pine, encoding="utf-8")
                 record["pine_path"] = str(path)
         except Exception as exc:
             record = {
-                "run_id": run_id,
-                "index": idx,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "hypothesis": h.model_dump(mode="json"),
-                "status": "REJECTED",
-                "error": str(exc),
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"), "status": "REJECTED", "error": str(exc),
             }
         records.append(record)
         print(f"[{idx + 1}/{len(hypotheses)}] {h.title} | {symbol} | {timeframe} -> {record['status']}")
@@ -291,36 +264,23 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         record["rank"] = rank
     leaderboard = [
         {
-            "rank": r["rank"],
-            "title": r["hypothesis"]["title"],
-            "status": r["status"],
+            "rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
             "score": r.get("out_of_sample", {}).get("research_score", 0.0),
-            "symbol": r["symbol"],
-            "timeframe": r["timeframe"],
+            "symbol": r["symbol"], "timeframe": r["timeframe"],
             "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
         }
         for r in records
     ]
     print("Leaderboard:")
     for row in leaderboard:
-        print(
-            f"  #{row['rank']} | {row['status']} | score={float(row['score']):.2f} | "
-            f"{row['title']} | {row['symbol']} | {row['timeframe']} | WF={row['walk_forward_passed']}"
-        )
+        print(f"  #{row['rank']} | {row['status']} | score={float(row['score']):.2f} | {row['title']} | {row['symbol']} | {row['timeframe']} | WF={row['walk_forward_passed']}")
 
     manifest = {
-        "run_id": run_id,
-        "created_at": now.isoformat(),
-        "capital": settings.capital.model_dump(),
-        "market_snapshot": snapshot,
-        "hypothesis_count": len(hypotheses),
-        "records": records,
+        "run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
+        "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
         "leaderboard": leaderboard,
     }
-    (out / "run.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
+    (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
         for record in records:
