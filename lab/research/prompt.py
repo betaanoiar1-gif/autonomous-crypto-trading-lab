@@ -12,6 +12,9 @@ Generate ONE diverse, falsifiable crypto trading hypothesis. Never promise profi
 Do not invent market data, test results, or sources.
 Use the SIMPLE LINE FORMAT and nothing else.
 Treat the supplied diversity slot as a hard execution constraint.
+The research memory contains prior rejected hypotheses. Do not repeat them or merely
+change a number by a tiny amount. Move to a materially different parameter region,
+while staying within the permitted range for the requested family.
 Output exactly one block:
 TITLE: ...
 THESIS: ...
@@ -57,17 +60,28 @@ def build_prompt(
         "trend_pullback": "LOOKBACK 5..200; PULLBACK_THRESHOLD 0.001..0.10 only",
         "channel_reversion": "CHANNEL_LENGTH 5..200 only",
     }
+    compact_failures = []
+    for rec in prior_failures[-25:]:
+        h = rec.get("hypothesis") or {}
+        compact_failures.append({
+            "family": h.get("executable_family"),
+            "parameters": h.get("executable_parameters", {}),
+            "symbol": h.get("symbols", [None])[0] if h.get("symbols") else None,
+            "timeframe": h.get("timeframes", [None])[0] if h.get("timeframes") else None,
+            "status": rec.get("status"),
+            "reasons": rec.get("rejection_reasons", []),
+        })
     payload = {
         "task": "Generate one crypto trading hypothesis for independent backtesting.",
         "market_snapshot": market_snapshot,
-        "prior_failures": prior_failures[-10:],
+        "prior_failures": compact_failures,
         "previous_hypotheses_in_this_run": (prior_hypotheses or [])[-10:],
         "diversity_slot": slot,
         "slot_is_hard_constraint": True,
         "families": SUPPORTED_FAMILIES,
         "required_family_for_this_slot": family,
         "required_parameter_schema_for_this_slot": parameter_rules.get(family, "family-specific parameters only"),
-        "diversity_rule": "Do not repeat previous hypotheses. Use the exact family, market, symbol, timeframe and direction requested by the slot.",
-        "max_hypotheses": 1,
+        "anti_repetition_rule": "Avoid the exact rejected parameters and move materially away from rejected parameter regions. Never invent results.",
+        "max_hypotheses": max_hypotheses,
     }
     return json.dumps(payload, ensure_ascii=False)
