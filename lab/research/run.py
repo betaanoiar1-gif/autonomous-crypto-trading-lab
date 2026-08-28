@@ -37,7 +37,7 @@ def _load_failures(path):
     return failures
 
 
-def _fetch_market(data, symbols, timeframe):
+def _fetch_market(symbols, timeframe):
     last_error = None
     for exchange_id in ("binance", "kraken"):
         try:
@@ -49,7 +49,7 @@ def _fetch_market(data, symbols, timeframe):
     raise RuntimeError(f"Public market data unavailable on fallback exchanges: {last_error}")
 
 
-def run(max_hypotheses: int = 4) -> dict:
+def run(max_hypotheses: int = 4, agent=None) -> dict:
     settings = load_settings()
     now = datetime.now(timezone.utc)
     run_id = now.strftime("RUN-%Y%m%dT%H%M%SZ")
@@ -61,7 +61,7 @@ def run(max_hypotheses: int = 4) -> dict:
 
     symbols = ["BTC/USDT", "ETH/USDT"]
     timeframe = "1h"
-    exchange_id, market = _fetch_market(CCXTMarketData(), symbols, timeframe)
+    exchange_id, market = _fetch_market(symbols, timeframe)
     snapshot = {
         "exchange": exchange_id,
         "timeframe": timeframe,
@@ -71,7 +71,7 @@ def run(max_hypotheses: int = 4) -> dict:
     }
 
     print(f"Data source: {exchange_id} | {timeframe} | {symbols}")
-    agent = LocalAgent()
+    agent = agent or LocalAgent()
     hypotheses = _safe_agent_hypotheses(agent, snapshot, max_hypotheses, prior_failures)
     print(f"Hypotheses generated: {len(hypotheses)}")
 
@@ -134,6 +134,7 @@ def run(max_hypotheses: int = 4) -> dict:
         "records": records,
     }
     (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
