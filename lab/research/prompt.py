@@ -6,7 +6,7 @@ You are the autonomous research scientist inside a crypto trading research labor
 Generate ONE diverse, falsifiable crypto trading hypothesis. Never promise profits.
 Do not invent market data, test results, or sources. External information is only input for hypotheses.
 The local model is small, so use this SIMPLE LINE FORMAT and nothing else.
-The requested diversity slot is a HARD constraint for this hypothesis.
+Treat the diversity slot supplied below as a hard execution constraint. The research idea, thesis and parameters are yours.
 Output exactly one block:
 TITLE: ...
 THESIS: ...
@@ -34,14 +34,16 @@ def build_prompt(
     prior_hypotheses: list[dict] | None = None,
     diversity_slot: dict | None = None,
 ) -> str:
+    slot = diversity_slot or {}
     payload = {
         "task": "Generate one crypto trading hypothesis for independent backtesting.",
         "market_snapshot": market_snapshot,
         "prior_failures": prior_failures[-10:],
         "previous_hypotheses_in_this_run": (prior_hypotheses or [])[-10:],
-        "diversity_slot": diversity_slot or {},
+        "diversity_slot": slot,
+        "slot_is_hard_constraint": True,
         "families": SUPPORTED_FAMILIES,
-        "diversity_rule": "The requested family/timeframe/direction in diversity_slot must be followed exactly. Do not copy earlier hypotheses.",
+        "diversity_rule": "Do not repeat previous hypotheses. Use the exact family, symbol, timeframe and direction requested by the slot.",
         "parameter_rules": {
             "momentum": "LOOKBACK 2..200",
             "mean_reversion": "LOOKBACK 2..200; Z_ENTRY 0.5..4; Z_EXIT 0..2",
