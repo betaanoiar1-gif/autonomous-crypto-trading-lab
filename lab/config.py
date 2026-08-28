@@ -13,6 +13,7 @@ class ResearchConfig(BaseModel):
     autonomous: bool = True
     internet_for_hypotheses: bool = True
     max_experiments_per_run: int = 25
+    max_autonomous_cycles: int = 10
     require_independent_validation: bool = True
 
 class ExecutionConfig(BaseModel):
