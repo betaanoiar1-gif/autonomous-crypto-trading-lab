@@ -5,24 +5,16 @@ from datetime import datetime, timezone
 import json
 
 from ..config import ROOT, load_settings
-from ..local_agent import LocalAgent
+from ..pine_factory import build_pine
+from .fast_generator import generate
 from .run import (
     DIVERSITY_SLOTS, SUPPORTED_TIMEFRAMES, SYMBOLS,
-    _enforce_slot, _load_failures, _next_timeframe,
-    _print_diagnostics, _safe_one_hypothesis, _status,
-    _direction_value, _fetch_markets_cached,
+    _load_failures, _next_timeframe, _print_diagnostics,
+    _direction_value, _fetch_markets_cached, _score, _status,
 )
 from .evaluator import evaluate, frozen_confirmation
 
 MAX_WORKERS = 4
-
-
-def _score(r):
-    if r.get("status") == "REJECTED":
-        return float("-inf")
-    oos = r.get("out_of_sample", {})
-    wf = r.get("robustness", {}).get("walk_forward", {})
-    return float(oos.get("research_score", 0.0)) + (50.0 if wf.get("passed") else 0.0)
 
 
 def _eval_one(idx, h, spot, futures, funding, futures_error, settings, run_id):
@@ -89,41 +81,39 @@ def run(max_hypotheses: int = 12, agent=None) -> dict:
         print(f"Futures data: connected | historical funding loaded | events={sum(len(v) for v in funding.values())} | cache=active")
     elif futures_error:
         print(f"Futures data: unavailable -> {futures_error}")
-    agent = agent or LocalAgent()
-    hypotheses = []
     target = min(max_hypotheses, len(DIVERSITY_SLOTS))
     print(f"Research slots requested: {target}")
-    for i, slot in enumerate(DIVERSITY_SLOTS[:target]):
-        try:
-            h = _enforce_slot(_safe_one_hypothesis(agent, snapshot, prior, [x.model_dump(mode='json') for x in hypotheses], slot), slot)
-            hypotheses.append(h)
-        except Exception as exc:
-            print(f"Hypothesis generation {i + 1} failed: {exc}")
+    print("Fast local hypothesis generation: active")
+    hypotheses = generate(prior, target)
+    for i, h in enumerate(hypotheses, 1):
+        print(f"  Slot {i}: {h.executable_family} | {h.market_types[0].value} | {h.symbols[0]} | {h.timeframes[0]} | {_direction_value(h.directions[0])}")
     print(f"Hypotheses generated: {len(hypotheses)}")
+    print(f"Parallel evaluation workers: {min(MAX_WORKERS, max(1, len(hypotheses)))}")
+    records = [None] * len(hypotheses)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="acl-eval") as pool:
-        futures_out = [pool.submit(_eval_one, i, h, spot, futures, funding, futures_error, settings, run_id) for i, h in enumerate(hypotheses)]
-        records = [f.result() for f in futures_out]
+        pending = {pool.submit(_eval_one, i, h, spot, futures, funding, futures_error, settings, run_id): i for i, h in enumerate(hypotheses)}
+        for fut, idx in ((f, i) for f, i in pending.items()):
+            records[idx] = fut.result()
     for i, (h, r) in enumerate(zip(hypotheses, records), 1):
-        print(f"[{i}/{len(hypotheses)}] {h.title} | {h.symbols[0]} | {h.timeframes[0]} -> {r['status']}")
+        print(f"[{i}/{len(records)}] {h.title} | {h.symbols[0]} | {h.timeframes[0]} -> {r['status']}")
         _print_diagnostics(r)
+        if r.get("status") == "VALIDATED" and settings.output.generate_pine and r.get("market_type") == "spot":
+            p = out / f"validated_candidate_{i}.pine"
+            p.write_text(build_pine(f"ACL {h.title[:50]}", h.executable_family, h.executable_parameters,
+                                    allow_short=any(_direction_value(d) in {"short", "both"} for d in h.directions)), encoding="utf-8")
+            r["pine_path"] = str(p)
     records.sort(key=_score, reverse=True)
-    for rank, r in enumerate(records, 1):
-        r["rank"] = rank
-    leaderboard = [{"rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
-                    "score": r.get("out_of_sample", {}).get("research_score", 0.0), "symbol": r["symbol"],
-                    "timeframe": r["timeframe"], "market_type": r["market_type"],
-                    "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
-                    "confirmation_passed": bool(r.get("confirmations")) and all(c.get("passed", False) for c in r.get("confirmations", []))}
-                   for r in records]
+    for rank, r in enumerate(records, 1): r["rank"] = rank
+    leaderboard = [{"rank":r["rank"],"title":r["hypothesis"]["title"],"status":r["status"],
+                    "score":r.get("out_of_sample",{}).get("research_score",0.0),"symbol":r["symbol"],
+                    "timeframe":r["timeframe"],"market_type":r["market_type"],
+                    "walk_forward_passed":r.get("robustness",{}).get("walk_forward",{}).get("passed",False),
+                    "confirmation_passed":bool(r.get("confirmations")) and all(c.get("passed",False) for c in r.get("confirmations",[]))} for r in records]
     print("Leaderboard:")
-    for r in leaderboard:
-        print(f"  #{r['rank']} | {r['status']} | score={float(r['score']):.2f} | {r['title']} | {r['symbol']} | {r['timeframe']} | {r['market_type']} | WF={r['walk_forward_passed']} | CONF={r['confirmation_passed']}")
-    manifest = {"run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
-                "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
-                "leaderboard": leaderboard, "evaluation_workers": MAX_WORKERS}
-    (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    memory.parent.mkdir(parents=True, exist_ok=True)
-    with memory.open("a", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    for r in leaderboard: print(f"  #{r['rank']} | {r['status']} | score={float(r['score']):.2f} | {r['title']} | {r['symbol']} | {r['timeframe']} | {r['market_type']} | WF={r['walk_forward_passed']} | CONF={r['confirmation_passed']}")
+    manifest={"run_id":run_id,"created_at":now.isoformat(),"capital":settings.capital.model_dump(),"market_snapshot":snapshot,
+              "hypothesis_count":len(hypotheses),"records":records,"leaderboard":leaderboard,"evaluation_workers":MAX_WORKERS,"fast_generation":True}
+    (out/"run.json").write_text(json.dumps(manifest,indent=2,ensure_ascii=False,default=str),encoding="utf-8")
+    with memory.open("a",encoding="utf-8") as f:
+        for r in records: f.write(json.dumps(r,ensure_ascii=False,default=str)+"\n")
     return manifest
