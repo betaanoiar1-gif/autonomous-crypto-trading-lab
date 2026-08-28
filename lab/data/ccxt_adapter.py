@@ -110,28 +110,53 @@ class CCXTMarketData:
         return out
 
     def fetch_funding_history(self, symbol: str, since_ms: int | None = None, until_ms: int | None = None,
-                              target_rows: int = 500) -> pd.Series:
-        """Fetch public historical funding rates for a futures contract via CCXT.
-
-        CCXT's unified `fetchFundingRateHistory` returns fundingRate as a decimal
-        at the funding timestamp. The method is public market data and needs no
-        API key on supported exchanges.
-        """
+                              target_rows: int = 500, page_limit: int = 1000) -> pd.Series:
+        """Fetch paginated historical funding rates for a futures contract via CCXT."""
         ex = self._exchange("futures")
         if not ex.has.get("fetchFundingRateHistory"):
             raise RuntimeError(f"{self.exchange_id} does not expose funding-rate history through CCXT")
         api_symbol = self._contract_symbol(symbol)
-        params = {}
-        if until_ms is not None:
-            params["until"] = int(until_ms)
-        rows = ex.fetch_funding_rate_history(api_symbol, since=since_ms, limit=min(target_rows, 1000), params=params)
-        points = []
-        for row in rows:
-            ts = row.get("timestamp")
-            rate = row.get("fundingRate")
-            if ts is None or rate is None:
-                continue
-            points.append((pd.to_datetime(int(ts), unit="ms", utc=True), float(rate)))
-        if not points:
+        collected: list[tuple[pd.Timestamp, float]] = []
+        cursor = int(since_ms) if since_ms is not None else None
+        max_pages = max(4, (target_rows // page_limit) + 8)
+        for _ in range(max_pages):
+            params = {}
+            if until_ms is not None:
+                params["until"] = int(until_ms)
+            rows = ex.fetch_funding_rate_history(api_symbol, since=cursor, limit=min(page_limit, 1000), params=params)
+            if not rows:
+                break
+            page_points = []
+            for row in rows:
+                ts = row.get("timestamp")
+                rate = row.get("fundingRate")
+                if ts is None or rate is None:
+                    continue
+                ts_i = int(ts)
+                if since_ms is not None and ts_i < since_ms:
+                    continue
+                if until_ms is not None and ts_i > until_ms:
+                    continue
+                page_points.append((pd.to_datetime(ts_i, unit="ms", utc=True), float(rate)))
+            collected.extend(page_points)
+            page_last = max((int(ts.timestamp() * 1000) for ts, _ in page_points), default=None)
+            if page_last is None:
+                break
+            if until_ms is not None and page_last >= until_ms:
+                break
+            if cursor is not None and page_last <= cursor:
+                break
+            if len(collected) >= target_rows and until_ms is None:
+                break
+            cursor = page_last + 1
+            time.sleep(0.05)
+        if not collected:
             raise RuntimeError(f"No historical funding rates returned for {symbol}")
-        return pd.Series(dict(points)).sort_index()
+        series = pd.Series(dict(collected)).sort_index()
+        if since_ms is not None:
+            series = series[series.index >= pd.to_datetime(since_ms, unit="ms", utc=True)]
+        if until_ms is not None:
+            series = series[series.index <= pd.to_datetime(until_ms, unit="ms", utc=True)]
+        if series.empty:
+            raise RuntimeError(f"Funding history for {symbol} contains no events in the requested interval")
+        return series
