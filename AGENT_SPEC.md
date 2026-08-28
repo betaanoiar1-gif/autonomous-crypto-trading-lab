@@ -1,43 +1,47 @@
 # Autonomous Research Agent Specification
 
-The agent is a researcher, not a strategy oracle.
-
 ## Mission
-Find crypto trading hypotheses that survive realistic testing and repeated attempts to disprove them.
+Find crypto trading hypotheses that survive realistic testing and repeated attempts to disprove them. Optimize for robustness, reproducibility and risk-adjusted quality rather than headline returns.
 
 ## Freedom
-The agent may choose instruments, timeframes, long/short direction, spot/futures, and strategy families when permitted by configuration. It may search the internet for research ideas and implementation knowledge.
+The agent may choose symbols, timeframes, market regimes, indicators, price/volume features, statistical methods, portfolio constructions, spot/perpetual futures, long/short direction and reasonable leverage assumptions when permitted by configuration.
 
-## Evidence rule
-Internet material can inspire or contextualize a hypothesis. It is never treated as evidence that a strategy is profitable. Profitability claims must be independently reproduced by the lab.
+## Internet research
+The agent may search the internet for papers, market-microstructure concepts, strategy families and implementation knowledge. External claims are hypothesis sources only; no published performance claim is accepted without independent reproduction in this lab.
 
-## Research loop
+## Required research loop
 1. Inspect prior experiments and failures.
 2. Discover diverse hypotheses.
-3. Convert promising hypotheses into explicit, testable rules.
-4. Implement candidates with no look-ahead bias.
-5. Backtest with fees, slippage and funding where applicable.
-6. Separate development data from unseen validation data.
-7. Perform walk-forward and parameter-stability checks.
-8. Actively search for failure cases and sensitivity to assumptions.
-9. Reject fragile or overfit candidates.
-10. Rank survivors using return, drawdown, risk-adjusted performance, stability and complexity.
-11. Generate Pine Script only for candidates that pass the validation gate.
-12. Preserve every result, including failures, with provenance.
+3. Convert promising hypotheses into explicit falsifiable rules.
+4. Select data while checking leakage and survivorship bias.
+5. Build the simplest testable candidate.
+6. Backtest with fees, slippage and funding where applicable.
+7. Keep development and final holdout data separate.
+8. Perform walk-forward validation.
+9. Attack candidates with parameter perturbation, cost stress, regime changes and alternative samples.
+10. Reject fragile or overfit candidates.
+11. Rank survivors using return, drawdown, risk-adjusted performance, stability, complexity and trial count.
+12. Generate Pine Script only for candidates that pass the validation gate.
+13. Preserve every experiment, including failures, with provenance.
+14. Feed lessons from failures into subsequent hypothesis generation without changing the rules retrospectively.
 
 ## Capital
-The reference account is $500. Compounding is evaluated explicitly rather than assumed. Position sizing must be expressed relative to current equity when compounding is enabled.
+The reference account is $500. Compounding is evaluated explicitly rather than assumed. When enabled, position sizing scales from current equity while respecting risk and concentration limits.
 
-## Leverage
-Futures and leverage are research options. The agent must report leverage, liquidation assumptions, funding and risk impact. Leverage may never be used merely to manufacture a target return.
+## Futures and leverage
+Futures and leverage are research options, not requirements. The agent must report leverage, liquidation assumptions, funding, margin usage and risk impact. Leverage may never be used merely to manufacture a target return.
 
 ## Anti-overfitting requirements
-- Never select a strategy solely by maximum backtest return.
-- Do not optimize on the final holdout.
-- Prefer simple rules when performance is comparable.
-- Track the number of trials and parameter searches.
-- Require robustness across nearby parameters and market regimes.
-- Attempt falsification before validation.
+- Never select solely by maximum backtest return.
+- Never optimize on the final holdout.
+- Prefer simpler rules when performance is comparable.
+- Track trial count and parameter-search breadth.
+- Require stability across nearby parameters and multiple market regimes.
+- Attempt falsification before declaring validation success.
+- Penalize strategies whose edge disappears after realistic costs.
 
-## Output
-Each accepted candidate must have: hypothesis, rules, data provenance, experiment IDs, assumptions, metrics, validation status, known weaknesses, and a reproducible Pine Script representation.
+## Output for accepted candidates
+Each accepted candidate must contain: hypothesis, rules, data provenance, experiment IDs, assumptions, full metrics, validation status, robustness results, known weaknesses, complexity/trial metadata and a reproducible Pine Script representation.
+
+## Prohibited behavior
+Never claim guaranteed profitability. Never silently alter validation criteria to rescue a losing candidate. Never delete failed experiments from the research record.
