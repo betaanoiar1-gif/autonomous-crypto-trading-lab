@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from .config import load_settings
 
 
@@ -14,8 +16,10 @@ def run(agent=None) -> None:
     from .research.run import DIVERSITY_SLOTS
     from .research.ultra_fast_run import run as research_run
 
-    cycles = max(1, int(getattr(settings.research, "max_autonomous_cycles", 10)))
-    target = min(int(settings.research.max_experiments_per_run), len(DIVERSITY_SLOTS))
+    default_cycles = max(1, int(getattr(settings.research, "max_autonomous_cycles", 10)))
+    cycles = max(1, int(os.getenv("ACL_MAX_AUTONOMOUS_CYCLES", default_cycles)))
+    requested_slots = int(os.getenv("ACL_MAX_SLOTS", settings.research.max_experiments_per_run))
+    target = min(max(1, requested_slots), len(DIVERSITY_SLOTS))
     print(f"Autonomous research cycles: up to {cycles}", flush=True)
     print(f"Research slots requested per cycle: {target}", flush=True)
 
