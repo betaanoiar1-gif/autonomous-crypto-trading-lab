@@ -37,7 +37,6 @@ def _run(df, family, params, directions, capital, fee_bps, slippage_bps):
 
 
 def _param_grid(family: str, base: dict) -> list[dict]:
-    """Small, bounded grids to limit tuning overfit while allowing re-selection per fold."""
     family = family.lower().strip()
     if family in {"momentum", "breakout"}:
         b = int(base.get("lookback", 20))
@@ -69,7 +68,6 @@ def _param_grid(family: str, base: dict) -> list[dict]:
 
 
 def _training_objective(metrics: dict) -> float:
-    """Reward return and quality, penalize drawdown and tiny samples."""
     trades = int(metrics.get("trade_count", 0))
     if trades < 4:
         return -10.0 + trades * 0.25
@@ -169,38 +167,53 @@ def evaluate(df: pd.DataFrame, family: str, params: dict, directions: list[str],
 
     split = int(len(df) * (1 - holdout_ratio))
     train, test = df.iloc[:split].copy(), df.iloc[split:].copy()
-    a = _run(train, family, params, directions, initial_capital, fee_bps, slippage_bps)
-    b = _run(test, family, params, directions, initial_capital, fee_bps, slippage_bps)
+
+    selected_params, main_tuning = _select_params(
+        train, family, params, directions, initial_capital, fee_bps, slippage_bps
+    )
+    a = _run(train, family, selected_params, directions, initial_capital, fee_bps, slippage_bps)
+    b = _run(test, family, selected_params, directions, initial_capital, fee_bps, slippage_bps)
 
     variants = []
-    for key in ("lookback", "fast", "slow"):
-        if key not in params:
-            continue
+    for key in selected_params:
         try:
-            base = int(params[key])
-            delta = max(1, int(base * 0.20))
-            for value in (base - delta, base + delta):
-                p = dict(params)
-                p[key] = max(2, value)
-                if key == "slow" and "fast" in p:
-                    p[key] = max(int(p["fast"]) + 1, p[key])
-                if key == "fast" and "slow" in p:
-                    p[key] = min(p[key], int(p["slow"]) - 1)
-                rr = _run(train, family, p, directions, initial_capital, fee_bps, slippage_bps)
-                variants.append(rr.metrics["total_return"])
+            base = selected_params[key]
+            if isinstance(base, int):
+                delta = max(1, int(base * 0.20))
+                for value in (base - delta, base + delta):
+                    p = dict(selected_params)
+                    p[key] = max(2, value)
+                    if key == "slow" and "fast" in p:
+                        p[key] = max(int(p["fast"]) + 1, p[key])
+                    if key == "fast" and "slow" in p:
+                        p[key] = min(p[key], int(p["slow"]) - 1)
+                    rr = _run(train, family, p, directions, initial_capital, fee_bps, slippage_bps)
+                    variants.append(rr.metrics["total_return"])
+            elif isinstance(base, float):
+                delta = max(0.01, abs(base) * 0.20)
+                for value in (base - delta, base + delta):
+                    p = dict(selected_params)
+                    p[key] = value
+                    if key == "z_exit" and "z_entry" in p:
+                        p[key] = min(p[key], float(p["z_entry"]) - 0.05)
+                    rr = _run(train, family, p, directions, initial_capital, fee_bps, slippage_bps)
+                    variants.append(rr.metrics["total_return"])
         except (TypeError, ValueError):
             continue
 
     base_ret = a.metrics["total_return"]
     stability = bool(not variants or min(variants) > base_ret - 0.25)
-    stressed = _run(test, family, params, directions, initial_capital, fee_bps * 2.0, slippage_bps * 2.0)
-    walk = _walk_forward(df, family, params, directions, initial_capital, fee_bps, slippage_bps)
+    stressed = _run(test, family, selected_params, directions, initial_capital, fee_bps * 2.0, slippage_bps * 2.0)
+    walk = _walk_forward(df, family, selected_params, directions, initial_capital, fee_bps, slippage_bps)
     in_metrics = _metrics(a, a.returns)
     out_metrics = _metrics(b, b.returns)
     out_metrics["research_score"] = _research_score(out_metrics, walk)
+    out_metrics["selected_parameters"] = dict(selected_params)
 
     robust = {
         "parameter_stability": stability,
+        "selected_parameters": dict(selected_params),
+        "main_training_tuning": main_tuning,
         "stressed_total_return": float(stressed.metrics["total_return"]),
         "stressed_max_drawdown": float(stressed.metrics["max_drawdown"]),
         "stressed_trade_count": _metrics(stressed, stressed.returns)["trade_count"],
