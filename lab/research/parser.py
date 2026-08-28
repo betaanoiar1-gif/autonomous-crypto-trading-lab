@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from uuid import uuid4
 from ..schemas import Hypothesis, MarketType, Direction
 
 
@@ -10,9 +9,11 @@ def parse_hypotheses(text: str) -> list[Hypothesis]:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Agent did not return valid JSON: {exc}") from exc
+
     items = raw.get("hypotheses")
     if not isinstance(items, list):
         raise ValueError("Missing hypotheses list")
+
     result: list[Hypothesis] = []
     for item in items:
         if not isinstance(item, dict):
@@ -30,6 +31,8 @@ def parse_hypotheses(text: str) -> list[Hypothesis]:
                     rationale_sources=[str(x) for x in item.get("rationale_sources", [])],
                     novelty=str(item.get("novelty", "unknown")),
                     falsification_plan=[str(x) for x in item.get("falsification_plan", [])],
+                    executable_family=str(item.get("executable_family", "momentum")),
+                    executable_parameters=dict(item.get("executable_parameters", {})),
                 )
             )
         except Exception as exc:
