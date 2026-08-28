@@ -10,8 +10,10 @@ def run(agent=None) -> None:
     if settings.research.autonomous:
         print("Starting autonomous research cycle...")
         from .research.run import run as research_run
+        target = min(4, len(research_run.DIVERSITY_SLOTS))
+        print(f"Research slots requested: {target}")
         result = research_run(
-            max_hypotheses=min(4, settings.research.max_experiments_per_run),
+            max_hypotheses=target,
             agent=agent,
         )
         statuses = [r.get("status", "UNKNOWN") for r in result["records"]]
