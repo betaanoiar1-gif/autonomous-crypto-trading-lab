@@ -46,27 +46,19 @@ def _direction_value(direction) -> str:
 def _enforce_slot(hypothesis, slot):
     family = slot["preferred_family"]
     params = dict(hypothesis.executable_parameters or {})
-    if family in {"momentum", "breakout", "mean_reversion"}:
-        try:
-            params["lookback"] = int(params.get("lookback", 20))
-        except (TypeError, ValueError):
-            params["lookback"] = 20
-    if family == "mean_reversion":
-        try:
-            params["z_entry"] = float(params.get("z_entry", 1.5))
-        except (TypeError, ValueError):
-            params["z_entry"] = 1.5
-        try:
-            params["z_exit"] = float(params.get("z_exit", 0.25))
-        except (TypeError, ValueError):
-            params["z_exit"] = 0.25
-    if family == "moving_average_cross":
-        try:
-            fast = int(params.get("fast", 10)); slow = int(params.get("slow", 40))
-        except (TypeError, ValueError):
-            fast, slow = 10, 40
-        params["fast"] = max(2, min(100, fast))
-        params["slow"] = max(params["fast"] + 1, min(300, slow))
+    # Drop parameters that do not belong to this executable family.
+    if family in {"momentum", "breakout"}:
+        params = {"lookback": int(params.get("lookback", 20))}
+    elif family == "mean_reversion":
+        params = {
+            "lookback": int(params.get("lookback", 40)),
+            "z_entry": float(params.get("z_entry", 1.5)),
+            "z_exit": float(params.get("z_exit", 0.25)),
+        }
+    elif family == "moving_average_cross":
+        fast = int(params.get("fast", 10))
+        slow = int(params.get("slow", 40))
+        params = {"fast": max(2, min(100, fast)), "slow": max(max(2, min(100, fast)) + 1, min(300, slow))}
     return hypothesis.model_copy(update={
         "executable_family": family,
         "executable_parameters": params,
@@ -95,7 +87,7 @@ def _fetch_market(symbols, timeframes):
     for exchange_id in ("binance", "kraken"):
         try:
             adapter = CCXTMarketData(exchange_id=exchange_id)
-            return exchange_id, adapter.fetch_multi_timeframes(symbols, timeframes, limit=1000)
+            return exchange_id, adapter.fetch_multi_timeframes(symbols, timeframes, limit=1500)
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"Public market data unavailable on fallback exchanges: {last_error}")
@@ -177,7 +169,10 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     for attempt in range(target):
         slot = DIVERSITY_SLOTS[attempt]
         try:
-            raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump(mode="json") for h in hypotheses], slot)
+            raw = _safe_one_hypothesis(
+                agent, snapshot, prior_failures,
+                [h.model_dump(mode="json") for h in hypotheses], slot
+            )
             h = _enforce_slot(raw, slot)
             signature = (
                 h.executable_family,
@@ -198,7 +193,10 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
             ):
                 h = h.model_copy(update={"thesis": h.thesis + f" | diversity slot {attempt + 1}"})
             hypotheses.append(h)
-            print(f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | {h.timeframes[0]} | {_direction_value(h.directions[0])}")
+            print(
+                f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | "
+                f"{h.timeframes[0]} | {_direction_value(h.directions[0])}"
+            )
         except Exception as exc:
             print(f"Hypothesis generation {attempt + 1} failed: {exc}")
 
@@ -211,20 +209,33 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         directions = [_direction_value(x) for x in h.directions]
         try:
             evaluation = evaluate(
-                df, h.executable_family or "momentum", h.executable_parameters, directions,
-                settings.capital.initial_usd, settings.execution.commission_bps,
-                settings.execution.slippage_bps, settings.validation.holdout_ratio,
+                df,
+                h.executable_family or "momentum",
+                h.executable_parameters,
+                directions,
+                settings.capital.initial_usd,
+                settings.execution.commission_bps,
+                settings.execution.slippage_bps,
+                settings.validation.holdout_ratio,
             )
             status = _status(evaluation)
             record = {
-                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                "hypothesis": h.model_dump(mode="json"), "status": status,
-                "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
-                "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons,
+                "run_id": run_id,
+                "index": idx,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"),
+                "status": status,
+                "in_sample": evaluation.in_sample,
+                "out_of_sample": evaluation.out_of_sample,
+                "robustness": evaluation.robustness,
+                "rejection_reasons": evaluation.rejection_reasons,
             }
             if status == "VALIDATED" and settings.output.generate_pine:
                 pine = build_pine(
-                    f"ACL {h.title[:50]}", h.executable_family or "momentum", h.executable_parameters,
+                    f"ACL {h.title[:50]}",
+                    h.executable_family or "momentum",
+                    h.executable_parameters,
                     allow_short=any(d in {"short", "both"} for d in directions),
                 )
                 path = out / f"validated_candidate_{idx + 1}.pine"
@@ -232,8 +243,13 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
                 record["pine_path"] = str(path)
         except Exception as exc:
             record = {
-                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                "hypothesis": h.model_dump(mode="json"), "status": "REJECTED", "error": str(exc),
+                "run_id": run_id,
+                "index": idx,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"),
+                "status": "REJECTED",
+                "error": str(exc),
             }
         records.append(record)
         print(f"[{idx + 1}/{len(hypotheses)}] {h.title} | {symbol} | {timeframe} -> {record['status']}")
@@ -244,9 +260,12 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         record["rank"] = rank
     leaderboard = [
         {
-            "rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
+            "rank": r["rank"],
+            "title": r["hypothesis"]["title"],
+            "status": r["status"],
             "score": r.get("out_of_sample", {}).get("research_score", 0.0),
-            "symbol": r["symbol"], "timeframe": r["timeframe"],
+            "symbol": r["symbol"],
+            "timeframe": r["timeframe"],
             "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
         }
         for r in records
@@ -259,11 +278,18 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         )
 
     manifest = {
-        "run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
-        "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
+        "run_id": run_id,
+        "created_at": now.isoformat(),
+        "capital": settings.capital.model_dump(),
+        "market_snapshot": snapshot,
+        "hypothesis_count": len(hypotheses),
+        "records": records,
         "leaderboard": leaderboard,
     }
-    (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    (out / "run.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
         for record in records:
