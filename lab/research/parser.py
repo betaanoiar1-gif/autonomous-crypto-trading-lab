@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import json
 from ..schemas import Hypothesis, MarketType, Direction
+from .json_utils import extract_json_object
 
 
 def parse_hypotheses(text: str) -> list[Hypothesis]:
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Agent did not return valid JSON: {exc}") from exc
-
+    raw = extract_json_object(text)
     items = raw.get("hypotheses")
     if not isinstance(items, list):
         raise ValueError("Missing hypotheses list")
@@ -37,4 +33,6 @@ def parse_hypotheses(text: str) -> list[Hypothesis]:
             )
         except Exception as exc:
             raise ValueError(f"Invalid hypothesis payload: {item}") from exc
+    if not result:
+        raise ValueError("Agent returned no usable hypotheses")
     return result
