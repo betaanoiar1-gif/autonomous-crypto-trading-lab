@@ -7,6 +7,7 @@ from ..config import ROOT, load_settings
 from ..data.ccxt_adapter import CCXTMarketData
 from ..local_agent import LocalAgent
 from ..pine_factory import build_pine
+from ..schemas import Direction
 from .parser import parse_hypotheses
 from .prompt import build_prompt, SYSTEM as RESEARCH_SYSTEM
 from .evaluator import evaluate
@@ -33,21 +34,41 @@ def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses, slot
         return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))[0]
 
 
+def _direction_value(direction) -> str:
+    if isinstance(direction, Direction):
+        return direction.value
+    value = str(direction).strip().lower()
+    return value if value in {"long", "short", "both"} else "long"
+
+
 def _enforce_slot(hypothesis, slot):
     family = slot["preferred_family"]
     params = dict(hypothesis.executable_parameters or {})
     if family in {"momentum", "breakout", "mean_reversion"}:
-        params["lookback"] = int(params.get("lookback", 20))
+        try:
+            params["lookback"] = int(params.get("lookback", 20))
+        except (TypeError, ValueError):
+            params["lookback"] = 20
     if family == "mean_reversion":
-        params["z_entry"] = float(params.get("z_entry", 1.5))
-        params["z_exit"] = float(params.get("z_exit", 0.25))
+        try:
+            params["z_entry"] = float(params.get("z_entry", 1.5))
+        except (TypeError, ValueError):
+            params["z_entry"] = 1.5
+        try:
+            params["z_exit"] = float(params.get("z_exit", 0.25))
+        except (TypeError, ValueError):
+            params["z_exit"] = 0.25
     if family == "moving_average_cross":
-        fast = int(params.get("fast", 10)); slow = int(params.get("slow", 40))
-        params["fast"] = max(2, min(100, fast)); params["slow"] = max(params["fast"] + 1, min(300, slow))
+        try:
+            fast = int(params.get("fast", 10)); slow = int(params.get("slow", 40))
+        except (TypeError, ValueError):
+            fast, slow = 10, 40
+        params["fast"] = max(2, min(100, fast))
+        params["slow"] = max(params["fast"] + 1, min(300, slow))
     return hypothesis.model_copy(update={
         "executable_family": family,
         "executable_parameters": params,
-        "directions": [slot["preferred_direction"]],
+        "directions": [Direction(_direction_value(slot["preferred_direction"]))],
         "timeframes": [slot["preferred_timeframe"]],
         "symbols": [slot["preferred_symbol"]],
     })
@@ -110,11 +131,11 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         try:
             raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump() for h in hypotheses], slot)
             h = _enforce_slot(raw, slot)
-            signature = (h.executable_family, tuple(h.directions), tuple(h.symbols), tuple(h.timeframes), h.thesis.strip().lower())
-            if any(signature == (x.executable_family, tuple(x.directions), tuple(x.symbols), tuple(x.timeframes), x.thesis.strip().lower()) for x in hypotheses):
+            signature = (h.executable_family, tuple(_direction_value(x) for x in h.directions), tuple(h.symbols), tuple(h.timeframes), h.thesis.strip().lower())
+            if any(signature == (x.executable_family, tuple(_direction_value(y) for y in x.directions), tuple(x.symbols), tuple(x.timeframes), x.thesis.strip().lower()) for x in hypotheses):
                 h = h.model_copy(update={"thesis": h.thesis + f" | diversity slot {attempt + 1}"})
             hypotheses.append(h)
-            print(f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | {h.timeframes[0]} | {h.directions[0]}")
+            print(f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | {h.timeframes[0]} | {_direction_value(h.directions[0])}")
         except Exception as exc:
             print(f"Hypothesis generation {attempt + 1} failed: {exc}")
 
@@ -124,14 +145,14 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         symbol = h.symbols[0] if h.symbols and h.symbols[0] in SYMBOLS else SYMBOLS[0]
         timeframe = h.timeframes[0] if h.timeframes and h.timeframes[0] in SUPPORTED_TIMEFRAMES else "1h"
         df = market[(symbol, timeframe)]
-        directions = [x.value for x in h.directions]
+        directions = [_direction_value(x) for x in h.directions]
         try:
             evaluation = evaluate(df, h.executable_family or "momentum", h.executable_parameters, directions,
                                   settings.capital.initial_usd, settings.execution.commission_bps,
                                   settings.execution.slippage_bps, settings.validation.holdout_ratio)
             status = "VALIDATED" if evaluation.passed else ("VALIDATION_CANDIDATE" if evaluation.out_of_sample.get("total_return", 0) > 0 else "REJECTED")
             record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                      "hypothesis": h.model_dump(), "status": status,
+                      "hypothesis": h.model_dump(mode="json"), "status": status,
                       "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
                       "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons}
             if status == "VALIDATED" and settings.output.generate_pine:
@@ -142,7 +163,7 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
                 record["pine_path"] = str(path)
         except Exception as exc:
             record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                      "hypothesis": h.model_dump(), "status": "REJECTED", "error": str(exc)}
+                      "hypothesis": h.model_dump(mode="json"), "status": "REJECTED", "error": str(exc)}
         records.append(record)
         print(f"[{idx + 1}/{len(hypotheses)}] {h.title} | {symbol} | {timeframe} -> {record['status']}")
 
