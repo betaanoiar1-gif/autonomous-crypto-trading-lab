@@ -18,6 +18,9 @@ DIVERSITY_SLOTS = [
     {"preferred_family": "moving_average_cross", "preferred_timeframe": "1h", "preferred_symbol": "ETH/USDT", "preferred_direction": "short"},
 ]
 
+SUPPORTED_TIMEFRAMES = ["15m", "1h", "4h"]
+SYMBOLS = ["BTC/USDT", "ETH/USDT"]
+
 
 def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses, slot):
     prompt = build_prompt(snapshot, prior_failures, 1, prior_hypotheses, diversity_slot=slot)
@@ -73,12 +76,17 @@ def _load_failures(path):
     return failures
 
 
-def _fetch_market(symbols, timeframe):
+def _fetch_market(symbols, timeframes):
+    """Fetch each unique symbol/timeframe pair once, with exchange fallback."""
     last_error = None
     for exchange_id in ("binance", "kraken"):
         try:
             adapter = CCXTMarketData(exchange_id=exchange_id)
-            market = adapter.fetch_multi(symbols, timeframe=timeframe, limit=1000)
+            market = {}
+            for timeframe in timeframes:
+                per_tf = adapter.fetch_multi(symbols, timeframe=timeframe, limit=1000)
+                for symbol, df in per_tf.items():
+                    market[(symbol, timeframe)] = df
             return exchange_id, market
         except Exception as exc:
             last_error = exc
@@ -94,27 +102,37 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
 
     memory_path = ROOT / "experiments" / "memory.jsonl"
     prior_failures = _load_failures(memory_path)
-    symbols = ["BTC/USDT", "ETH/USDT"]
-    base_timeframe = "1h"
-    exchange_id, market = _fetch_market(symbols, base_timeframe)
+    exchange_id, market = _fetch_market(SYMBOLS, SUPPORTED_TIMEFRAMES)
     snapshot = {
         "exchange": exchange_id,
-        "timeframe": base_timeframe,
-        "symbols": symbols,
-        "observations": {k: len(v) for k, v in market.items()},
-        "latest": {k: {"close": float(v["close"].iloc[-1])} for k, v in market.items()},
+        "available_timeframes": SUPPORTED_TIMEFRAMES,
+        "symbols": SYMBOLS,
+        "observations": {f"{symbol}@{tf}": len(df) for (symbol, tf), df in market.items()},
+        "latest": {f"{symbol}@{tf}": {"close": float(df["close"].iloc[-1])} for (symbol, tf), df in market.items()},
     }
 
-    print(f"Data source: {exchange_id} | {base_timeframe} | {symbols}")
+    print(f"Data source: {exchange_id} | timeframes={SUPPORTED_TIMEFRAMES} | symbols={SYMBOLS}")
     agent = agent or LocalAgent()
     hypotheses = []
     target = min(max_hypotheses, len(DIVERSITY_SLOTS))
     for attempt in range(target):
         slot = DIVERSITY_SLOTS[attempt]
         try:
-            raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump() for h in hypotheses], slot)
+            raw = _safe_one_hypothesis(
+                agent,
+                snapshot,
+                prior_failures,
+                [h.model_dump() for h in hypotheses],
+                slot,
+            )
             hypothesis = _enforce_slot(raw, slot)
-            signature = (hypothesis.executable_family, tuple(hypothesis.directions), tuple(hypothesis.symbols), tuple(hypothesis.timeframes), hypothesis.thesis.strip().lower())
+            signature = (
+                hypothesis.executable_family,
+                tuple(hypothesis.directions),
+                tuple(hypothesis.symbols),
+                tuple(hypothesis.timeframes),
+                hypothesis.thesis.strip().lower(),
+            )
             if any(signature == (h.executable_family, tuple(h.directions), tuple(h.symbols), tuple(h.timeframes), h.thesis.strip().lower()) for h in hypotheses):
                 hypothesis = hypothesis.model_copy(update={"thesis": hypothesis.thesis + f" | diversity slot {attempt + 1}"})
             hypotheses.append(hypothesis)
@@ -124,30 +142,48 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     print(f"Hypotheses generated: {len(hypotheses)}")
     records = []
     for idx, hypothesis in enumerate(hypotheses):
-        symbol = next((s for s in hypothesis.symbols if s in market), symbols[0])
-        df = market[symbol]
+        requested_symbol = hypothesis.symbols[0] if hypothesis.symbols else SYMBOLS[0]
+        requested_timeframe = hypothesis.timeframes[0] if hypothesis.timeframes else "1h"
+        symbol = requested_symbol if requested_symbol in SYMBOLS else SYMBOLS[0]
+        timeframe = requested_timeframe if requested_timeframe in SUPPORTED_TIMEFRAMES else "1h"
+        df = market[(symbol, timeframe)]
         directions = [x.value for x in hypothesis.directions]
         family = hypothesis.executable_family or "momentum"
         try:
-            evaluation = evaluate(df, family, hypothesis.executable_parameters, directions, settings.capital.initial_usd, settings.execution.commission_bps, settings.execution.slippage_bps, settings.validation.holdout_ratio)
+            evaluation = evaluate(
+                df, family, hypothesis.executable_parameters, directions,
+                settings.capital.initial_usd,
+                settings.execution.commission_bps,
+                settings.execution.slippage_bps,
+                settings.validation.holdout_ratio,
+            )
             record = {
-                "run_id": run_id, "index": idx, "symbol": symbol,
-                "timeframe": hypothesis.timeframes[0] if hypothesis.timeframes else base_timeframe,
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
                 "hypothesis": hypothesis.model_dump(),
                 "status": "VALIDATION_CANDIDATE" if evaluation.passed else "REJECTED",
                 "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
                 "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons,
             }
             if evaluation.passed and settings.output.generate_pine:
-                pine = build_pine(f"ACL {hypothesis.title[:50]}", family, hypothesis.executable_parameters, allow_short=any(d in {"short", "both"} for d in directions))
+                pine = build_pine(
+                    f"ACL {hypothesis.title[:50]}", family, hypothesis.executable_parameters,
+                    allow_short=any(d in {"short", "both"} for d in directions),
+                )
                 (out / f"candidate_{idx + 1}.pine").write_text(pine, encoding="utf-8")
                 record["pine_path"] = str(out / f"candidate_{idx + 1}.pine")
         except Exception as exc:
-            record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": hypothesis.timeframes[0] if hypothesis.timeframes else base_timeframe, "hypothesis": hypothesis.model_dump(), "status": "REJECTED", "error": str(exc)}
+            record = {
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": hypothesis.model_dump(), "status": "REJECTED", "error": str(exc),
+            }
         records.append(record)
-        print(f"[{idx + 1}/{len(hypotheses)}] {hypothesis.title} -> {record['status']}")
+        print(f"[{idx + 1}/{len(hypotheses)}] {hypothesis.title} | {symbol} | {timeframe} -> {record['status']}")
 
-    manifest = {"run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(), "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records}
+    manifest = {
+        "run_id": run_id, "created_at": now.isoformat(),
+        "capital": settings.capital.model_dump(), "market_snapshot": snapshot,
+        "hypothesis_count": len(hypotheses), "records": records,
+    }
     (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
