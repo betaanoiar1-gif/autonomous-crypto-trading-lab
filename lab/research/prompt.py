@@ -12,6 +12,14 @@ Generate ONE diverse, falsifiable crypto trading hypothesis. Never promise profi
 Do not invent market data, test results, or sources.
 Use the SIMPLE LINE FORMAT and nothing else.
 Treat the supplied diversity slot as a hard execution constraint.
+
+GENERALIZATION IS A PRIMARY RESEARCH OBJECTIVE:
+- Prefer mechanisms that plausibly describe market behavior rather than a symbol-specific quirk.
+- Prefer parameter regions that are not narrowly tuned to one asset or one timeframe.
+- The hypothesis will be tested with the SAME frozen parameters on another symbol and a neighboring timeframe.
+- Do not assume success on the requested symbol implies success elsewhere.
+- Make the thesis explicit about why the mechanism should generalize across BTC and ETH and across nearby timeframes.
+
 The research memory contains prior rejected hypotheses. Do not repeat them or merely
 change a number by a tiny amount. Move to a materially different parameter region,
 while staying within the permitted range for the requested family.
@@ -81,6 +89,11 @@ def build_prompt(
         "families": SUPPORTED_FAMILIES,
         "required_family_for_this_slot": family,
         "required_parameter_schema_for_this_slot": parameter_rules.get(family, "family-specific parameters only"),
+        "generalization_target": {
+            "symbols": ["BTC/USDT", "ETH/USDT"],
+            "timeframes": ["15m", "1h", "4h"],
+            "rule": "Choose a mechanism and parameter region expected to remain meaningful across both assets and neighboring timeframes. Never assume the preferred symbol/timeframe is uniquely favorable.",
+        },
         "anti_repetition_rule": "Avoid the exact rejected parameters and move materially away from rejected parameter regions. Never invent results.",
         "max_hypotheses": max_hypotheses,
     }
