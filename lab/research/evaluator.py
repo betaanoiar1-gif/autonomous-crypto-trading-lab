@@ -38,45 +38,59 @@ def _run(df, family, params, directions, capital, fee_bps, slippage_bps):
 def _walk_forward(df, family, params, directions, capital, fee_bps, slippage_bps, windows=4):
     n = len(df)
     if n < 240:
-        return {"windows": [], "positive_windows": 0, "median_return": 0.0}
+        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0, "median_sharpe": 0.0, "min_trade_count": 0, "passed": False}
     train_size = max(120, int(n * 0.45))
     test_size = max(40, int((n - train_size) / windows))
     rows = []
     start = 0
     while len(rows) < windows and start + train_size + test_size <= n:
-        train = df.iloc[start:start + train_size]
         test = df.iloc[start + train_size:start + train_size + test_size]
         result = _run(test, family, params, directions, capital, fee_bps, slippage_bps)
+        m = _metrics(result, result.returns)
         rows.append({
+            "fold": len(rows) + 1,
             "start": str(test.index[0]),
             "end": str(test.index[-1]),
-            "total_return": result.metrics["total_return"],
-            "max_drawdown": result.metrics["max_drawdown"],
-            "profit_factor": result.metrics["profit_factor"],
-            "trade_count": _metrics(result, result.returns)["trade_count"],
+            "total_return": float(m["total_return"]),
+            "max_drawdown": float(m["max_drawdown"]),
+            "profit_factor": float(m["profit_factor"]),
+            "sharpe": float(m["sharpe"]),
+            "trade_count": int(m["trade_count"]),
         })
         start += test_size
     if not rows:
-        return {"windows": [], "positive_windows": 0, "median_return": 0.0}
-    rets = [r["total_return"] for r in rows]
+        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0, "median_sharpe": 0.0, "min_trade_count": 0, "passed": False}
+    rets = np.array([r["total_return"] for r in rows], dtype=float)
+    sharpes = np.array([r["sharpe"] for r in rows], dtype=float)
+    trades = np.array([r["trade_count"] for r in rows], dtype=float)
+    positive = int(np.sum(rets > 0))
+    positive_ratio = float(positive / len(rows))
+    median_return = float(np.median(rets))
+    min_trades = int(np.min(trades)) if len(trades) else 0
+    passed = bool(len(rows) >= 3 and positive_ratio >= 0.75 and median_return > 0 and min_trades >= 4)
     return {
         "windows": rows,
-        "positive_windows": int(sum(r > 0 for r in rets)),
-        "median_return": float(np.median(rets)),
-        "worst_return": float(min(rets)),
+        "positive_windows": positive,
+        "positive_ratio": positive_ratio,
+        "median_return": median_return,
+        "worst_return": float(np.min(rets)),
+        "median_sharpe": float(np.median(sharpes)),
+        "min_trade_count": min_trades,
+        "passed": passed,
     }
 
 
-def evaluate(
-    df: pd.DataFrame,
-    family: str,
-    params: dict,
-    directions: list[str],
-    initial_capital: float,
-    fee_bps: float,
-    slippage_bps: float,
-    holdout_ratio: float = 0.30,
-) -> Evaluation:
+def _research_score(oos: dict, walk: dict) -> float:
+    ret = float(oos.get("total_return", 0.0))
+    sh = float(oos.get("sharpe", 0.0))
+    dd = abs(min(0.0, float(oos.get("max_drawdown", 0.0))))
+    wf = float(walk.get("median_return", 0.0))
+    wf_sh = float(walk.get("median_sharpe", 0.0))
+    return float(100.0 * ret + 5.0 * sh + 75.0 * wf + 2.0 * wf_sh - 20.0 * dd)
+
+
+def evaluate(df: pd.DataFrame, family: str, params: dict, directions: list[str], initial_capital: float,
+             fee_bps: float, slippage_bps: float, holdout_ratio: float = 0.30) -> Evaluation:
     if len(df) < 240:
         raise ValueError("Not enough observations for robust evaluation; need at least 240")
 
@@ -102,22 +116,20 @@ def evaluate(
                 rr = _run(train, family, p, directions, initial_capital, fee_bps, slippage_bps)
                 variants.append(rr.metrics["total_return"])
         except (TypeError, ValueError):
-            pass
+            continue
 
     base_ret = a.metrics["total_return"]
     stability = bool(not variants or min(variants) > base_ret - 0.25)
-
     stressed = _run(test, family, params, directions, initial_capital, fee_bps * 2.0, slippage_bps * 2.0)
-    walk = _walk_forward(
-        df, family, params, directions, initial_capital, fee_bps, slippage_bps, windows=4
-    )
-
+    walk = _walk_forward(df, family, params, directions, initial_capital, fee_bps, slippage_bps)
     in_metrics = _metrics(a, a.returns)
     out_metrics = _metrics(b, b.returns)
+    out_metrics["research_score"] = _research_score(out_metrics, walk)
+
     robust = {
         "parameter_stability": stability,
-        "stressed_total_return": stressed.metrics["total_return"],
-        "stressed_max_drawdown": stressed.metrics["max_drawdown"],
+        "stressed_total_return": float(stressed.metrics["total_return"]),
+        "stressed_max_drawdown": float(stressed.metrics["max_drawdown"]),
         "stressed_trade_count": _metrics(stressed, stressed.returns)["trade_count"],
         "walk_forward": walk,
     }
@@ -135,7 +147,7 @@ def evaluate(
         reasons.append("Parameter stability failed")
     if stressed.metrics["total_return"] <= 0:
         reasons.append("Fails doubled-cost stress test")
-    if walk["windows"] and walk["positive_windows"] < max(2, len(walk["windows"]) // 2 + 1):
+    if not walk["passed"]:
         reasons.append("Walk-forward consistency failed")
 
     return Evaluation(in_metrics, out_metrics, robust, not reasons, reasons)
