@@ -8,9 +8,21 @@ def _num(params: dict, key: str, default: float) -> float:
         return float(default)
 
 
-def build_pine(name: str, family: str, params: dict, allow_short: bool = True) -> str:
+def build_pine(
+    name: str,
+    family: str,
+    params: dict,
+    allow_short: bool = True,
+    commission_bps: float = 10.0,
+    slippage_bps: float = 5.0,
+    initial_capital: float = 500.0,
+) -> str:
     family = family.lower().strip()
     short = str(bool(allow_short)).lower()
+    commission_pct = max(0.0, float(commission_bps)) / 100.0
+    slippage_ticks = max(0, int(round(float(slippage_bps))))
+    capital = max(1.0, float(initial_capital))
+
     if family == "momentum":
         n = int(max(2, min(200, _num(params, "lookback", 20))))
         body = f"""len = input.int({n}, 'Lookback', minval=2, maxval=200)\nscore = close / close[len] - 1\npos = score > 0 ? 1 : ({short} and score < 0 ? -1 : 0)"""
@@ -25,8 +37,8 @@ def build_pine(name: str, family: str, params: dict, allow_short: bool = True) -
     elif family == "moving_average_cross":
         fast = int(max(2, min(100, _num(params, "fast", 10))))
         slow = int(max(fast + 1, min(300, _num(params, "slow", 40))))
-        body = f"""fastLen = input.int({fast}, 'Fast', minval=2, maxval=100)\nslowLen = input.int({slow}, 'Slow', minval=3, maxval=300)\nfast = ta.ema(close, fastLen)\nslow = ta.ema(close, slowLen)\nvar int pos = 0\nif ta.crossover(fast, slow)\n    pos := 1\nelse if {short} and ta.crossunder(fast, slow)\n    pos := -1"""
+        body = f"""fastLen = input.int({fast}, 'Fast', minval=2, maxval=100)\nslowLen = input.int({slow}, 'Slow', minval=3, maxval=300)\nfast = ta.ema(close, fastLen)\nslow = ta.ema(close, slowLen)\nvar int pos = 0\nif fast > slow\n    pos := 1\nelse if {short} and fast < slow\n    pos := -1"""
     else:
         raise ValueError(f"Unsupported Pine family: {family}")
 
-    return f"""//@version=6\nstrategy({name!r}, overlay=true, initial_capital=500, pyramiding=0)\n\n{body}\n\nif pos == 1\n    strategy.entry('L', strategy.long)\nelse if pos == -1\n    strategy.entry('S', strategy.short)\nelse\n    strategy.close('L')\n    strategy.close('S')\n"""
+    return f"""//@version=6\nstrategy({name!r}, overlay=true, initial_capital={capital:.2f}, pyramiding=0, commission_type=strategy.commission.percent, commission_value={commission_pct:.4f}, slippage={slippage_ticks})\n\n{body}\n\nif pos == 1\n    strategy.entry('L', strategy.long)\nelse if pos == -1\n    strategy.entry('S', strategy.short)\nelse\n    strategy.close('L')\n    strategy.close('S')\n"""
