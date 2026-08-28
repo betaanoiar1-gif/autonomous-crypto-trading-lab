@@ -21,6 +21,10 @@ DIVERSITY_SLOTS = [
     {"preferred_family": "atr_breakout", "preferred_market": "futures", "preferred_timeframe": "15m", "preferred_symbol": "ETH/USDT", "preferred_direction": "both"},
     {"preferred_family": "trend_pullback", "preferred_market": "spot", "preferred_timeframe": "4h", "preferred_symbol": "ETH/USDT", "preferred_direction": "long"},
     {"preferred_family": "channel_reversion", "preferred_market": "spot", "preferred_timeframe": "1h", "preferred_symbol": "BTC/USDT", "preferred_direction": "both"},
+    {"preferred_family": "momentum", "preferred_market": "spot", "preferred_timeframe": "1h", "preferred_symbol": "ETH/USDT", "preferred_direction": "both"},
+    {"preferred_family": "breakout", "preferred_market": "spot", "preferred_timeframe": "4h", "preferred_symbol": "ETH/USDT", "preferred_direction": "both"},
+    {"preferred_family": "moving_average_cross", "preferred_market": "spot", "preferred_timeframe": "1h", "preferred_symbol": "BTC/USDT", "preferred_direction": "both"},
+    {"preferred_family": "atr_breakout", "preferred_market": "futures", "preferred_timeframe": "15m", "preferred_symbol": "BTC/USDT", "preferred_direction": "both"},
 ]
 SUPPORTED_TIMEFRAMES = ["15m", "1h", "4h"]
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
@@ -122,37 +126,37 @@ def _score(record):
     return float(oos.get("research_score", 0.0)) + (50.0 if walk.get("passed") else 0.0)
 
 
-def _status(evaluation):
-    if evaluation.passed:
-        return "VALIDATED"
-    oos = evaluation.out_of_sample
-    robust = evaluation.robustness
-    if (
-        float(oos.get("total_return", 0)) > 0
-        and float(oos.get("profit_factor", 0)) > 1.0
-        and float(oos.get("max_drawdown", 0)) >= -0.50
-        and float(robust.get("stressed_total_return", 0)) > 0
-    ):
-        return "VALIDATION_CANDIDATE"
-    return "REJECTED"
+def _status(evaluation, confirmations=None):
+    confirmations = confirmations or []
+    if not evaluation.passed:
+        oos = evaluation.out_of_sample
+        robust = evaluation.robustness
+        if (
+            float(oos.get("total_return", 0)) > 0
+            and float(oos.get("profit_factor", 0)) > 1.0
+            and float(oos.get("max_drawdown", 0)) >= -0.50
+            and float(robust.get("stressed_total_return", 0)) > 0
+        ):
+            return "VALIDATION_CANDIDATE"
+        return "REJECTED"
+    return "VALIDATED" if confirmations and all(c.get("passed", False) for c in confirmations) else "VALIDATION_CANDIDATE"
 
 
-def _print_confirmation(confirmation):
-    if not confirmation:
-        return
-    metrics = confirmation.get("metrics", {})
-    market = confirmation.get("market", {})
-    print(
-        f"    Confirmation: {market.get('symbol', '?')} | {market.get('timeframe', '?')} | "
-        f"return={float(metrics.get('total_return', 0)):.2%} | "
-        f"PF={float(metrics.get('profit_factor', 0)):.2f} | "
-        f"DD={float(metrics.get('max_drawdown', 0)):.2%} | "
-        f"trades={int(metrics.get('trade_count', 0))} | "
-        f"Sharpe={float(metrics.get('sharpe', 0)):.2f} | "
-        f"PASS={confirmation.get('passed', False)}"
-    )
-    if confirmation.get("rejection_reasons"):
-        print("    Confirmation reasons: " + "; ".join(confirmation["rejection_reasons"]))
+def _print_confirmations(confirmations):
+    for confirmation in confirmations or []:
+        metrics = confirmation.get("metrics", {})
+        market = confirmation.get("market", {})
+        print(
+            f"    Confirmation: {market.get('symbol', '?')} | {market.get('timeframe', '?')} | "
+            f"return={float(metrics.get('total_return', 0)):.2%} | "
+            f"PF={float(metrics.get('profit_factor', 0)):.2f} | "
+            f"DD={float(metrics.get('max_drawdown', 0)):.2%} | "
+            f"trades={int(metrics.get('trade_count', 0))} | "
+            f"Sharpe={float(metrics.get('sharpe', 0)):.2f} | "
+            f"PASS={confirmation.get('passed', False)}"
+        )
+        if confirmation.get("rejection_reasons"):
+            print("    Confirmation reasons: " + "; ".join(confirmation["rejection_reasons"]))
 
 
 def _print_diagnostics(record):
@@ -161,14 +165,22 @@ def _print_diagnostics(record):
     walk = robust.get("walk_forward", {})
     print(f"    OOS: return={float(oos.get('total_return',0)):.2%} | PF={float(oos.get('profit_factor',0)):.2f} | DD={float(oos.get('max_drawdown',0)):.2%} | trades={int(oos.get('trade_count',0))} | Sharpe={float(oos.get('sharpe',0)):.2f}")
     print(f"    Robustness: WF={'PASS' if walk.get('passed') else 'FAIL'} | positive_folds={walk.get('positive_windows',0)}/{len(walk.get('windows',[]))} | median_WF_return={float(walk.get('median_return',0)):.2%} | stress_return={float(robust.get('stressed_total_return',0)):.2%} | stability={'PASS' if robust.get('parameter_stability') else 'FAIL'}")
-    _print_confirmation(record.get("confirmation"))
+    _print_confirmations(record.get("confirmations", []))
     if record.get("rejection_reasons"):
         print("    Reasons: " + "; ".join(record["rejection_reasons"]))
     if record.get("error"):
         print("    Error: " + str(record["error"]))
 
 
-def run(max_hypotheses: int = 8, agent=None) -> dict:
+def _next_timeframe(timeframe):
+    try:
+        i = SUPPORTED_TIMEFRAMES.index(timeframe)
+    except ValueError:
+        return None
+    return SUPPORTED_TIMEFRAMES[i + 1] if i + 1 < len(SUPPORTED_TIMEFRAMES) else SUPPORTED_TIMEFRAMES[i - 1] if i > 0 else None
+
+
+def run(max_hypotheses: int = 12, agent=None) -> dict:
     settings = load_settings()
     now = datetime.now(timezone.utc)
     run_id = now.strftime("RUN-%Y%m%dT%H%M%SZ")
@@ -192,7 +204,7 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
                 symbol,
                 since_ms=int(first_index.timestamp() * 1000),
                 until_ms=int(last_index.timestamp() * 1000),
-                target_rows=2000,
+                target_rows=3000,
             )
     except Exception as exc:
         futures_error = exc
@@ -208,7 +220,8 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
     print(f"Data source: binance | timeframes={SUPPORTED_TIMEFRAMES} | symbols={SYMBOLS}")
     print(f"Spot observations: {sum(snapshot['observations_spot'].values())} total rows across pairs/factors")
     if isinstance(futures_market, dict) and not futures_error:
-        print("Futures data: connected | historical funding loaded")
+        total_funding_events = sum(len(v) for v in futures_funding.values())
+        print(f"Futures data: connected | historical funding loaded | events={total_funding_events}")
     elif futures_error:
         print(f"Futures data: unavailable -> {futures_error}")
     agent = agent or LocalAgent()
@@ -246,36 +259,44 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
                     settings.execution.slippage_bps, settings.validation.holdout_ratio,
                     market_type=market_type, leverage=leverage, funding_rates=funding,
                 )
-                status = _status(evaluation)
-                confirmation = None
-                if status in {"VALIDATION_CANDIDATE", "VALIDATED"}:
-                    confirmation_symbol = next((s for s in SYMBOLS if s != symbol), None)
-                    if confirmation_symbol is None:
-                        confirmation = {"passed": False, "rejection_reasons": ["No independent confirmation symbol available"], "market": {}}
-                    else:
-                        confirmation_market = active_market[(confirmation_symbol, timeframe)]
-                        confirmation_funding = None if market_type == "spot" else futures_funding.get(confirmation_symbol)
-                        frozen_params = dict(evaluation.out_of_sample.get("selected_parameters", h.executable_parameters))
-                        confirmation = frozen_confirmation(
-                            confirmation_market, h.executable_family, frozen_params, directions,
-                            settings.capital.initial_usd, settings.execution.commission_bps,
-                            settings.execution.slippage_bps, market_type=market_type,
-                            leverage=leverage, funding_rates=confirmation_funding,
-                        )
-                        confirmation["market"] = {"symbol": confirmation_symbol, "timeframe": timeframe}
-                    if status == "VALIDATED" and not confirmation.get("passed", False):
-                        status = "VALIDATION_CANDIDATE"
-                    elif status == "VALIDATED" and confirmation.get("passed", False):
-                        status = "VALIDATED"
+                confirmations = []
+                initial_status = _status(evaluation, confirmations=[])
+                if initial_status in {"VALIDATION_CANDIDATE", "VALIDATED"} and evaluation.passed:
+                    frozen_params = dict(evaluation.out_of_sample.get("selected_parameters", h.executable_parameters))
+                    # Primary confirmation: the other market at the same timeframe.
+                    other_symbol = next((s for s in SYMBOLS if s != symbol), None)
+                    if other_symbol is not None:
+                        confirmation_funding = None if market_type == "spot" else futures_funding.get(other_symbol)
+                        confirmations.append({
+                            **frozen_confirmation(
+                                active_market[(other_symbol, timeframe)], h.executable_family, frozen_params, directions,
+                                settings.capital.initial_usd, settings.execution.commission_bps,
+                                settings.execution.slippage_bps, market_type=market_type,
+                                leverage=leverage, funding_rates=confirmation_funding,
+                            ),
+                            "market": {"symbol": other_symbol, "timeframe": timeframe, "type": "cross_market"},
+                        })
+                    # Secondary confirmation: same market at a neighboring timeframe.
+                    neighbor_tf = _next_timeframe(timeframe)
+                    if neighbor_tf is not None:
+                        confirmation_funding = None if market_type == "spot" else futures_funding.get(symbol)
+                        confirmations.append({
+                            **frozen_confirmation(
+                                active_market[(symbol, neighbor_tf)], h.executable_family, frozen_params, directions,
+                                settings.capital.initial_usd, settings.execution.commission_bps,
+                                settings.execution.slippage_bps, market_type=market_type,
+                                leverage=leverage, funding_rates=confirmation_funding,
+                            ),
+                            "market": {"symbol": symbol, "timeframe": neighbor_tf, "type": "cross_timeframe"},
+                        })
+                status = _status(evaluation, confirmations)
                 rejection_reasons = list(evaluation.rejection_reasons)
-                if status == "VALIDATION_CANDIDATE" and confirmation is not None and not evaluation.passed:
-                    pass
-                if status == "VALIDATION_CANDIDATE" and confirmation is not None and evaluation.passed and not confirmation.get("passed", False):
-                    rejection_reasons.append("Independent confirmation failed")
+                if evaluation.passed and confirmations and not all(c.get("passed", False) for c in confirmations):
+                    rejection_reasons.append("Independent generalization failed")
                 record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe, "market_type": market_type,
                           "hypothesis": h.model_dump(mode="json"), "status": status, "in_sample": evaluation.in_sample,
                           "out_of_sample": evaluation.out_of_sample, "robustness": evaluation.robustness,
-                          "rejection_reasons": rejection_reasons, "confirmation": confirmation}
+                          "rejection_reasons": rejection_reasons, "confirmations": confirmations}
                 if status == "VALIDATED" and settings.output.generate_pine and market_type == "spot":
                     pine = build_pine(f"ACL {h.title[:50]}", h.executable_family, h.executable_parameters,
                                       allow_short=any(d in {"short", "both"} for d in directions))
@@ -296,7 +317,7 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
                     "score": r.get("out_of_sample", {}).get("research_score", 0.0), "symbol": r["symbol"],
                     "timeframe": r["timeframe"], "market_type": r["market_type"],
                     "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
-                    "confirmation_passed": r.get("confirmation", {}).get("passed", False) if r.get("confirmation") else False} for r in records]
+                    "confirmation_passed": bool(r.get("confirmations")) and all(c.get("passed", False) for c in r.get("confirmations", []))} for r in records]
     print("Leaderboard:")
     for r in leaderboard:
         print(f"  #{r['rank']} | {r['status']} | score={float(r['score']):.2f} | {r['title']} | {r['symbol']} | {r['timeframe']} | {r['market_type']} | WF={r['walk_forward_passed']} | CONF={r['confirmation_passed']}")
