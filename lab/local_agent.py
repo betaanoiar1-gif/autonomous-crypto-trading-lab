@@ -10,9 +10,8 @@ SYSTEM_PROMPT = """
 You are an autonomous quantitative crypto research scientist.
 Generate falsifiable hypotheses and useful reasoning, but never claim guaranteed profitability.
 Use information to form hypotheses; empirical validation must come from the research lab.
-Do not invent data, results or tests.
-When JSON is requested, return one compact JSON object and nothing else.
-Do not use markdown fences. Do not include a <think> section in the final answer.
+Do not invent data, test results or sources.
+When structured output is requested, follow the requested compact format.
 """.strip()
 
 
@@ -87,4 +86,5 @@ class LocalAgent:
 
     def healthcheck(self) -> dict:
         text = self.chat("Reply with exactly: LOCAL_OK")
-        return {"ok": text.strip() == "LOCAL_OK", "model": self.model_name}
+        normalized = " ".join(text.split()).upper()
+        return {"ok": "LOCAL_OK" in normalized, "model": self.model_name}
