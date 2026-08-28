@@ -43,23 +43,54 @@ def _direction_value(direction) -> str:
     return value if value in {"long", "short", "both"} else "long"
 
 
+def _to_int(value, default, lo, hi):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
+def _to_float(value, default, lo, hi):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
 def _enforce_slot(hypothesis, slot):
     family = slot["preferred_family"]
-    params = dict(hypothesis.executable_parameters or {})
-    # Drop parameters that do not belong to this executable family.
+    raw = dict(hypothesis.executable_parameters or {})
     if family in {"momentum", "breakout"}:
-        params = {"lookback": int(params.get("lookback", 20))}
+        params = {"lookback": _to_int(raw.get("lookback", 20), 20, 2, 200)}
     elif family == "mean_reversion":
+        z_entry = _to_float(raw.get("z_entry", 1.5), 1.5, 0.8, 3.5)
+        z_exit = _to_float(raw.get("z_exit", 0.25), 0.25, 0.05, 1.5)
+        z_exit = min(z_exit, max(0.05, z_entry - 0.05))
         params = {
-            "lookback": int(params.get("lookback", 40)),
-            "z_entry": float(params.get("z_entry", 1.5)),
-            "z_exit": float(params.get("z_exit", 0.25)),
+            "lookback": _to_int(raw.get("lookback", 40), 40, 10, 200),
+            "z_entry": z_entry,
+            "z_exit": z_exit,
         }
     elif family == "moving_average_cross":
-        fast = int(params.get("fast", 10))
-        slow = int(params.get("slow", 40))
-        params = {"fast": max(2, min(100, fast)), "slow": max(max(2, min(100, fast)) + 1, min(300, slow))}
+        fast = _to_int(raw.get("fast", 10), 10, 2, 100)
+        slow = _to_int(raw.get("slow", 40), 40, 3, 300)
+        slow = max(fast + 1, slow)
+        params = {"fast": fast, "slow": slow}
+    else:
+        params = raw
+    title_map = {
+        "momentum": f"Momentum | lookback={params['lookback']}",
+        "breakout": f"Breakout | lookback={params['lookback']}",
+        "mean_reversion": (
+            f"Mean Reversion | lookback={params['lookback']} | "
+            f"z_entry={params['z_entry']:.2f} | z_exit={params['z_exit']:.2f}"
+        ),
+        "moving_average_cross": f"Moving Average Cross | fast={params['fast']} | slow={params['slow']}",
+    }
     return hypothesis.model_copy(update={
+        "title": title_map.get(family, hypothesis.title),
         "executable_family": family,
         "executable_parameters": params,
         "directions": [Direction(_direction_value(slot["preferred_direction"]))],
