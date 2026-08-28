@@ -17,9 +17,12 @@ class Hypothesis(BaseModel):
     directions: list[Direction]
     timeframes: list[str]
     symbols: list[str]
+    rules: list[str] = Field(default_factory=list)
     rationale_sources: list[str] = Field(default_factory=list)
     novelty: str = "unknown"
     falsification_plan: list[str] = Field(default_factory=list)
+    executable_family: str = ""
+    executable_parameters: dict = Field(default_factory=dict)
 
 class StrategyCandidate(BaseModel):
     candidate_id: str
