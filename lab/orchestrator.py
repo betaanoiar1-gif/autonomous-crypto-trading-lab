@@ -11,19 +11,17 @@ def run(agent=None) -> None:
         print("Autonomous research is disabled in configuration.")
         return
 
-    from .research.run import run as research_run
+    from .research import run as _unused
+    from .research.run import DIVERSITY_SLOTS, run as research_run
 
-    cycles = max(1, int(settings.research.max_autonomous_cycles))
-    target = min(settings.research.max_experiments_per_run, len(research_run.DIVERSITY_SLOTS))
+    cycles = max(1, int(getattr(settings.research, "max_autonomous_cycles", 10)))
+    target = min(int(settings.research.max_experiments_per_run), len(DIVERSITY_SLOTS))
     print(f"Autonomous research cycles: up to {cycles}")
     print(f"Research slots requested per cycle: {target}")
 
     for cycle in range(1, cycles + 1):
         print(f"\n=== Autonomous cycle {cycle}/{cycles} ===")
-        result = research_run(
-            max_hypotheses=target,
-            agent=agent,
-        )
+        result = research_run(max_hypotheses=target, agent=agent)
         statuses = [r.get("status", "UNKNOWN") for r in result["records"]]
         validated = [r for r in result["records"] if r.get("status") == "VALIDATED"]
         candidates = [r for r in result["records"] if r.get("status") == "VALIDATION_CANDIDATE"]
