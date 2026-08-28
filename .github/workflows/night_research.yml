@@ -1,0 +1,45 @@
+name: Night Research
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile project
+        run: python -m compileall -q lab
+
+      - name: Run extended autonomous research
+        env:
+          ACL_MAX_AUTONOMOUS_CYCLES: "60"
+          ACL_MAX_SLOTS: "12"
+        run: python -u -m lab.orchestrator
+
+      - name: Upload research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overnight-research-results
+          path: experiments/
+          if-no-files-found: warn
+          retention-days: 7
