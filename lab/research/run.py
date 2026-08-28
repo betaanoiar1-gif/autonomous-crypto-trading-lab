@@ -10,7 +10,7 @@ from ..pine_factory import build_pine
 from ..schemas import Direction, MarketType
 from .parser import parse_hypotheses
 from .prompt import build_prompt, SYSTEM as RESEARCH_SYSTEM
-from .evaluator import evaluate
+from .evaluator import evaluate, frozen_confirmation
 
 DIVERSITY_SLOTS = [
     {"preferred_family": "momentum", "preferred_market": "spot", "preferred_timeframe": "15m", "preferred_symbol": "BTC/USDT", "preferred_direction": "long"},
@@ -137,12 +137,31 @@ def _status(evaluation):
     return "REJECTED"
 
 
+def _print_confirmation(confirmation):
+    if not confirmation:
+        return
+    metrics = confirmation.get("metrics", {})
+    market = confirmation.get("market", {})
+    print(
+        f"    Confirmation: {market.get('symbol', '?')} | {market.get('timeframe', '?')} | "
+        f"return={float(metrics.get('total_return', 0)):.2%} | "
+        f"PF={float(metrics.get('profit_factor', 0)):.2f} | "
+        f"DD={float(metrics.get('max_drawdown', 0)):.2%} | "
+        f"trades={int(metrics.get('trade_count', 0))} | "
+        f"Sharpe={float(metrics.get('sharpe', 0)):.2f} | "
+        f"PASS={confirmation.get('passed', False)}"
+    )
+    if confirmation.get("rejection_reasons"):
+        print("    Confirmation reasons: " + "; ".join(confirmation["rejection_reasons"]))
+
+
 def _print_diagnostics(record):
     oos = record.get("out_of_sample", {})
     robust = record.get("robustness", {})
     walk = robust.get("walk_forward", {})
-    print(f"    OOS: return={float(oos.get('total_return', 0)):.2%} | PF={float(oos.get('profit_factor', 0)):.2f} | DD={float(oos.get('max_drawdown', 0)):.2%} | trades={int(oos.get('trade_count', 0))} | Sharpe={float(oos.get('sharpe', 0)):.2f}")
-    print(f"    Robustness: WF={'PASS' if walk.get('passed') else 'FAIL'} | positive_folds={walk.get('positive_windows', 0)}/{len(walk.get('windows', []))} | median_WF_return={float(walk.get('median_return', 0)):.2%} | stress_return={float(robust.get('stressed_total_return', 0)):.2%} | stability={'PASS' if robust.get('parameter_stability') else 'FAIL'}")
+    print(f"    OOS: return={float(oos.get('total_return',0)):.2%} | PF={float(oos.get('profit_factor',0)):.2f} | DD={float(oos.get('max_drawdown',0)):.2%} | trades={int(oos.get('trade_count',0))} | Sharpe={float(oos.get('sharpe',0)):.2f}")
+    print(f"    Robustness: WF={'PASS' if walk.get('passed') else 'FAIL'} | positive_folds={walk.get('positive_windows',0)}/{len(walk.get('windows',[]))} | median_WF_return={float(walk.get('median_return',0)):.2%} | stress_return={float(robust.get('stressed_total_return',0)):.2%} | stability={'PASS' if robust.get('parameter_stability') else 'FAIL'}")
+    _print_confirmation(record.get("confirmation"))
     if record.get("rejection_reasons"):
         print("    Reasons: " + "; ".join(record["rejection_reasons"]))
     if record.get("error"):
@@ -220,19 +239,44 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
             try:
                 active_market = spot_market if market_type == "spot" else futures_market
                 funding = None if market_type == "spot" else futures_funding.get(symbol)
+                leverage = 2.0 if market_type == "futures" else 1.0
                 evaluation = evaluate(
                     active_market[(symbol, timeframe)], h.executable_family, h.executable_parameters, directions,
                     settings.capital.initial_usd, settings.execution.commission_bps,
                     settings.execution.slippage_bps, settings.validation.holdout_ratio,
-                    market_type=market_type, leverage=2.0 if market_type == "futures" else 1.0,
-                    funding_rates=funding,
+                    market_type=market_type, leverage=leverage, funding_rates=funding,
                 )
                 status = _status(evaluation)
+                confirmation = None
+                if status in {"VALIDATION_CANDIDATE", "VALIDATED"}:
+                    confirmation_symbol = next((s for s in SYMBOLS if s != symbol), None)
+                    if confirmation_symbol is None:
+                        confirmation = {"passed": False, "rejection_reasons": ["No independent confirmation symbol available"], "market": {}}
+                    else:
+                        confirmation_market = active_market[(confirmation_symbol, timeframe)]
+                        confirmation_funding = None if market_type == "spot" else futures_funding.get(confirmation_symbol)
+                        frozen_params = dict(evaluation.out_of_sample.get("selected_parameters", h.executable_parameters))
+                        confirmation = frozen_confirmation(
+                            confirmation_market, h.executable_family, frozen_params, directions,
+                            settings.capital.initial_usd, settings.execution.commission_bps,
+                            settings.execution.slippage_bps, market_type=market_type,
+                            leverage=leverage, funding_rates=confirmation_funding,
+                        )
+                        confirmation["market"] = {"symbol": confirmation_symbol, "timeframe": timeframe}
+                    if status == "VALIDATED" and not confirmation.get("passed", False):
+                        status = "VALIDATION_CANDIDATE"
+                    elif status == "VALIDATED" and confirmation.get("passed", False):
+                        status = "VALIDATED"
+                rejection_reasons = list(evaluation.rejection_reasons)
+                if status == "VALIDATION_CANDIDATE" and confirmation is not None and not evaluation.passed:
+                    pass
+                if status == "VALIDATION_CANDIDATE" and confirmation is not None and evaluation.passed and not confirmation.get("passed", False):
+                    rejection_reasons.append("Independent confirmation failed")
                 record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe, "market_type": market_type,
                           "hypothesis": h.model_dump(mode="json"), "status": status, "in_sample": evaluation.in_sample,
                           "out_of_sample": evaluation.out_of_sample, "robustness": evaluation.robustness,
-                          "rejection_reasons": evaluation.rejection_reasons}
-                if status == "VALIDATED" and settings.output.generate_pine:
+                          "rejection_reasons": rejection_reasons, "confirmation": confirmation}
+                if status == "VALIDATED" and settings.output.generate_pine and market_type == "spot":
                     pine = build_pine(f"ACL {h.title[:50]}", h.executable_family, h.executable_parameters,
                                       allow_short=any(d in {"short", "both"} for d in directions))
                     path = out / f"validated_candidate_{idx + 1}.pine"
@@ -251,10 +295,11 @@ def run(max_hypotheses: int = 8, agent=None) -> dict:
     leaderboard = [{"rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
                     "score": r.get("out_of_sample", {}).get("research_score", 0.0), "symbol": r["symbol"],
                     "timeframe": r["timeframe"], "market_type": r["market_type"],
-                    "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False)} for r in records]
+                    "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
+                    "confirmation_passed": r.get("confirmation", {}).get("passed", False) if r.get("confirmation") else False} for r in records]
     print("Leaderboard:")
     for r in leaderboard:
-        print(f"  #{r['rank']} | {r['status']} | score={float(r['score']):.2f} | {r['title']} | {r['symbol']} | {r['timeframe']} | {r['market_type']} | WF={r['walk_forward_passed']}")
+        print(f"  #{r['rank']} | {r['status']} | score={float(r['score']):.2f} | {r['title']} | {r['symbol']} | {r['timeframe']} | {r['market_type']} | WF={r['walk_forward_passed']} | CONF={r['confirmation_passed']}")
 
     manifest = {"run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
                 "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records, "leaderboard": leaderboard}
