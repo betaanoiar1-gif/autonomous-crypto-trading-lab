@@ -3,15 +3,33 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-DEFAULT_MODEL = os.getenv("LOCAL_MODEL", "Qwen/Qwen3-0.6B")
+DEFAULT_SMALL_MODEL = "Qwen/Qwen3-0.6B"
+DEFAULT_LARGER_MODEL = "Qwen/Qwen3-1.7B"
+
+
+def choose_default_model() -> str:
+    explicit = os.getenv("LOCAL_MODEL")
+    if explicit:
+        return explicit
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            if props.total_memory >= 8 * 1024**3:
+                return DEFAULT_LARGER_MODEL
+    except Exception:
+        pass
+    return DEFAULT_SMALL_MODEL
+
 
 @dataclass
 class LocalAgent:
-    model_name: str = DEFAULT_MODEL
-    max_new_tokens: int = 512
+    model_name: str | None = None
+    max_new_tokens: int = 768
     temperature: float = 0.2
 
     def __post_init__(self) -> None:
+        self.model_name = self.model_name or choose_default_model()
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -26,9 +44,7 @@ class LocalAgent:
                 tokenizer=self.tokenizer,
             )
         except Exception as exc:
-            raise RuntimeError(
-                f"Unable to load local model {self.model_name}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Unable to load local model {self.model_name}: {exc}") from exc
 
     def chat(self, prompt: str, system: str | None = None) -> str:
         messages = []
