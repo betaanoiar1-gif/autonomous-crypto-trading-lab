@@ -28,9 +28,11 @@ def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses, slot
     try:
         return parse_hypotheses(text)[0]
     except (ValueError, IndexError):
-        retry = ("Return exactly ONE hypothesis block using the required line format. "
-                 "End with END. No JSON, markdown, analysis, or commentary. "
-                 f"Follow this diversity slot: {slot}\n\n" + prompt)
+        retry = (
+            "Return exactly ONE hypothesis block using the required line format. "
+            "End with END. No JSON, markdown, analysis, or commentary. "
+            f"Follow this diversity slot: {slot}\n\n" + prompt
+        )
         return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))[0]
 
 
@@ -104,6 +106,21 @@ def _score(record):
     return float(oos.get("research_score", 0.0)) + (50.0 if walk.get("passed") else 0.0)
 
 
+def _status(evaluation):
+    if evaluation.passed:
+        return "VALIDATED"
+    oos = evaluation.out_of_sample
+    robust = evaluation.robustness
+    if (
+        float(oos.get("total_return", 0.0)) > 0
+        and float(oos.get("profit_factor", 0.0)) > 1.0
+        and float(oos.get("max_drawdown", 0.0)) >= -0.50
+        and float(robust.get("stressed_total_return", 0.0)) > 0
+    ):
+        return "VALIDATION_CANDIDATE"
+    return "REJECTED"
+
+
 def run(max_hypotheses: int = 4, agent=None) -> dict:
     settings = load_settings()
     now = datetime.now(timezone.utc)
@@ -129,7 +146,7 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     for attempt in range(target):
         slot = DIVERSITY_SLOTS[attempt]
         try:
-            raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump() for h in hypotheses], slot)
+            raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump(mode="json") for h in hypotheses], slot)
             h = _enforce_slot(raw, slot)
             signature = (h.executable_family, tuple(_direction_value(x) for x in h.directions), tuple(h.symbols), tuple(h.timeframes), h.thesis.strip().lower())
             if any(signature == (x.executable_family, tuple(_direction_value(y) for y in x.directions), tuple(x.symbols), tuple(x.timeframes), x.thesis.strip().lower()) for x in hypotheses):
@@ -147,34 +164,47 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         df = market[(symbol, timeframe)]
         directions = [_direction_value(x) for x in h.directions]
         try:
-            evaluation = evaluate(df, h.executable_family or "momentum", h.executable_parameters, directions,
-                                  settings.capital.initial_usd, settings.execution.commission_bps,
-                                  settings.execution.slippage_bps, settings.validation.holdout_ratio)
-            status = "VALIDATED" if evaluation.passed else ("VALIDATION_CANDIDATE" if evaluation.out_of_sample.get("total_return", 0) > 0 else "REJECTED")
-            record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                      "hypothesis": h.model_dump(mode="json"), "status": status,
-                      "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
-                      "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons}
+            evaluation = evaluate(
+                df, h.executable_family or "momentum", h.executable_parameters, directions,
+                settings.capital.initial_usd, settings.execution.commission_bps,
+                settings.execution.slippage_bps, settings.validation.holdout_ratio,
+            )
+            status = _status(evaluation)
+            record = {
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"), "status": status,
+                "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
+                "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons,
+            }
             if status == "VALIDATED" and settings.output.generate_pine:
-                pine = build_pine(f"ACL {h.title[:50]}", h.executable_family or "momentum", h.executable_parameters,
-                                  allow_short=any(d in {"short", "both"} for d in directions))
+                pine = build_pine(
+                    f"ACL {h.title[:50]}", h.executable_family or "momentum", h.executable_parameters,
+                    allow_short=any(d in {"short", "both"} for d in directions),
+                )
                 path = out / f"validated_candidate_{idx + 1}.pine"
                 path.write_text(pine, encoding="utf-8")
                 record["pine_path"] = str(path)
         except Exception as exc:
-            record = {"run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
-                      "hypothesis": h.model_dump(mode="json"), "status": "REJECTED", "error": str(exc)}
+            record = {
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": h.model_dump(mode="json"), "status": "REJECTED", "error": str(exc),
+            }
         records.append(record)
         print(f"[{idx + 1}/{len(hypotheses)}] {h.title} | {symbol} | {timeframe} -> {record['status']}")
 
     records.sort(key=_score, reverse=True)
     for rank, record in enumerate(records, 1): record["rank"] = rank
-    leaderboard = [{"rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
-                    "score": r.get("out_of_sample", {}).get("research_score", 0.0),
-                    "symbol": r["symbol"], "timeframe": r["timeframe"]} for r in records]
-    manifest = {"run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
-                "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
-                "leaderboard": leaderboard}
+    leaderboard = [{
+        "rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
+        "score": r.get("out_of_sample", {}).get("research_score", 0.0),
+        "symbol": r["symbol"], "timeframe": r["timeframe"],
+        "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
+    } for r in records]
+    manifest = {
+        "run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
+        "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
+        "leaderboard": leaderboard,
+    }
     (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
