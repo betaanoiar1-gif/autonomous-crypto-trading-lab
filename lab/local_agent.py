@@ -6,6 +6,13 @@ from dataclasses import dataclass
 DEFAULT_SMALL_MODEL = "Qwen/Qwen3-0.6B"
 DEFAULT_LARGER_MODEL = "Qwen/Qwen3-1.7B"
 
+SYSTEM_PROMPT = """
+You are an autonomous quantitative crypto research scientist.
+Generate falsifiable hypotheses and useful reasoning, but never claim guaranteed profitability.
+Use information to form hypotheses; empirical validation must come from the research lab.
+Do not invent data, results or tests. Return requested structured output exactly when a schema is provided.
+""".strip()
+
 
 def choose_default_model() -> str:
     explicit = os.getenv("LOCAL_MODEL")
@@ -32,11 +39,13 @@ class LocalAgent:
         self.model_name = self.model_name or choose_default_model()
         try:
             from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+            import torch
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 device_map="auto",
-                torch_dtype="auto",
+                dtype=dtype,
             )
             self.pipe = pipeline(
                 "text-generation",
@@ -47,10 +56,10 @@ class LocalAgent:
             raise RuntimeError(f"Unable to load local model {self.model_name}: {exc}") from exc
 
     def chat(self, prompt: str, system: str | None = None) -> str:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        messages = [
+            {"role": "system", "content": system or SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
         output = self.pipe(
             messages,
             max_new_tokens=self.max_new_tokens,
