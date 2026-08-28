@@ -77,13 +77,16 @@ def _enforce_slot(hypothesis, slot):
 
 
 def _load_failures(path):
-    if not path.exists(): return []
+    if not path.exists():
+        return []
     failures = []
     for line in path.read_text(encoding="utf-8").splitlines()[-100:]:
         try:
             rec = json.loads(line)
-            if rec.get("status") == "REJECTED": failures.append(rec)
-        except json.JSONDecodeError: continue
+            if rec.get("status") == "REJECTED":
+                failures.append(rec)
+        except json.JSONDecodeError:
+            continue
     return failures
 
 
@@ -99,7 +102,8 @@ def _fetch_market(symbols, timeframes):
 
 
 def _score(record):
-    if record.get("status") == "REJECTED": return float("-inf")
+    if record.get("status") == "REJECTED":
+        return float("-inf")
     oos = record.get("out_of_sample", {})
     robust = record.get("robustness", {})
     walk = robust.get("walk_forward", {})
@@ -119,6 +123,33 @@ def _status(evaluation):
     ):
         return "VALIDATION_CANDIDATE"
     return "REJECTED"
+
+
+def _print_diagnostics(record):
+    oos = record.get("out_of_sample", {})
+    robust = record.get("robustness", {})
+    walk = robust.get("walk_forward", {})
+    print(
+        "    OOS: "
+        f"return={float(oos.get('total_return', 0.0)):.2%} | "
+        f"PF={float(oos.get('profit_factor', 0.0)):.2f} | "
+        f"DD={float(oos.get('max_drawdown', 0.0)):.2%} | "
+        f"trades={int(oos.get('trade_count', 0))} | "
+        f"Sharpe={float(oos.get('sharpe', 0.0)):.2f}"
+    )
+    print(
+        "    Robustness: "
+        f"WF={'PASS' if walk.get('passed') else 'FAIL'} | "
+        f"positive_folds={walk.get('positive_windows', 0)}/{len(walk.get('windows', []))} | "
+        f"median_WF_return={float(walk.get('median_return', 0.0)):.2%} | "
+        f"stress_return={float(robust.get('stressed_total_return', 0.0)):.2%} | "
+        f"stability={'PASS' if robust.get('parameter_stability') else 'FAIL'}"
+    )
+    reasons = record.get("rejection_reasons") or []
+    if reasons:
+        print("    Reasons: " + "; ".join(reasons))
+    if "error" in record:
+        print("    Error: " + str(record["error"]))
 
 
 def run(max_hypotheses: int = 4, agent=None) -> dict:
@@ -148,8 +179,23 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
         try:
             raw = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump(mode="json") for h in hypotheses], slot)
             h = _enforce_slot(raw, slot)
-            signature = (h.executable_family, tuple(_direction_value(x) for x in h.directions), tuple(h.symbols), tuple(h.timeframes), h.thesis.strip().lower())
-            if any(signature == (x.executable_family, tuple(_direction_value(y) for y in x.directions), tuple(x.symbols), tuple(x.timeframes), x.thesis.strip().lower()) for x in hypotheses):
+            signature = (
+                h.executable_family,
+                tuple(_direction_value(x) for x in h.directions),
+                tuple(h.symbols),
+                tuple(h.timeframes),
+                h.thesis.strip().lower(),
+            )
+            if any(
+                signature == (
+                    x.executable_family,
+                    tuple(_direction_value(y) for y in x.directions),
+                    tuple(x.symbols),
+                    tuple(x.timeframes),
+                    x.thesis.strip().lower(),
+                )
+                for x in hypotheses
+            ):
                 h = h.model_copy(update={"thesis": h.thesis + f" | diversity slot {attempt + 1}"})
             hypotheses.append(h)
             print(f"  Slot {attempt + 1}: {h.executable_family} | {h.symbols[0]} | {h.timeframes[0]} | {_direction_value(h.directions[0])}")
@@ -191,15 +237,27 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
             }
         records.append(record)
         print(f"[{idx + 1}/{len(hypotheses)}] {h.title} | {symbol} | {timeframe} -> {record['status']}")
+        _print_diagnostics(record)
 
     records.sort(key=_score, reverse=True)
-    for rank, record in enumerate(records, 1): record["rank"] = rank
-    leaderboard = [{
-        "rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
-        "score": r.get("out_of_sample", {}).get("research_score", 0.0),
-        "symbol": r["symbol"], "timeframe": r["timeframe"],
-        "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
-    } for r in records]
+    for rank, record in enumerate(records, 1):
+        record["rank"] = rank
+    leaderboard = [
+        {
+            "rank": r["rank"], "title": r["hypothesis"]["title"], "status": r["status"],
+            "score": r.get("out_of_sample", {}).get("research_score", 0.0),
+            "symbol": r["symbol"], "timeframe": r["timeframe"],
+            "walk_forward_passed": r.get("robustness", {}).get("walk_forward", {}).get("passed", False),
+        }
+        for r in records
+    ]
+    print("Leaderboard:")
+    for row in leaderboard:
+        print(
+            f"  #{row['rank']} | {row['status']} | score={float(row['score']):.2f} | "
+            f"{row['title']} | {row['symbol']} | {row['timeframe']} | WF={row['walk_forward_passed']}"
+        )
+
     manifest = {
         "run_id": run_id, "created_at": now.isoformat(), "capital": settings.capital.model_dump(),
         "market_snapshot": snapshot, "hypothesis_count": len(hypotheses), "records": records,
@@ -208,5 +266,6 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
     (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     memory_path.parent.mkdir(parents=True, exist_ok=True)
     with memory_path.open("a", encoding="utf-8") as f:
-        for record in records: f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     return manifest
