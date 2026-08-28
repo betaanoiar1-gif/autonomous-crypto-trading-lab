@@ -19,16 +19,22 @@ def _count_position_changes(pos: pd.Series) -> int:
 
 
 def _align_funding_rates(index: pd.DatetimeIndex, funding_rates: pd.Series | None) -> pd.Series:
-    if funding_rates is None:
-        return pd.Series(0.0, index=index)
+    """Map each actual funding event to the first OHLCV bar at/after it."""
+    out = pd.Series(0.0, index=index)
+    if funding_rates is None or len(index) == 0:
+        return out
     rates = pd.Series(funding_rates).copy()
     rates.index = pd.to_datetime(rates.index, utc=True)
     rates = pd.to_numeric(rates, errors="coerce").dropna().sort_index()
     if rates.empty:
-        return pd.Series(0.0, index=index)
-    # Funding is charged at the reported settlement timestamps only; do not
-    # forward-fill a rate across ordinary bars.
-    return rates.groupby(level=0).last().reindex(index).fillna(0.0)
+        return out
+    idx_ns = index.view("int64")
+    for ts, rate in rates.groupby(level=0).last().items():
+        ts_ns = pd.Timestamp(ts).value
+        pos = int(np.searchsorted(idx_ns, ts_ns, side="left"))
+        if pos < len(out):
+            out.iloc[pos] += float(rate)
+    return out
 
 
 def run_ohlcv(
@@ -75,8 +81,6 @@ def run_ohlcv(
     if market_type == "futures" and funding_rates is not None and actual_funding.abs().sum() > 0:
         funding_costs = next_pos * actual_funding * effective_leverage
     elif market_type == "futures" and funding_bps_per_8h > 0 and len(data) > 1:
-        # Fallback only when historical funding data is unavailable.
-        # The configured amount is a conservative per-8h assumption.
         median_delta = data.index.to_series().diff().dropna().median()
         hours_per_bar = max(float(median_delta.total_seconds()) / 3600.0, 1e-9)
         funding_per_bar = funding_bps_per_8h / 10_000.0 * (hours_per_bar / 8.0)
@@ -107,6 +111,11 @@ def run_ohlcv(
     gains = float(pnl[pnl > 0].sum())
     losses = float(-pnl[pnl < 0].sum())
 
+    funding_source = (
+        "historical"
+        if market_type == "futures" and funding_rates is not None and actual_funding.abs().sum() > 0
+        else ("assumption" if market_type == "futures" else "none")
+    )
     metrics = {
         "total_return": float(equity.iloc[-1] / initial_capital - 1.0),
         "max_drawdown": float(drawdown.min()),
@@ -119,7 +128,8 @@ def run_ohlcv(
         "short_exposure": float((next_pos < 0).mean()),
         "cost_drag": float(trading_costs.sum()),
         "funding_drag": float(funding_costs.sum()),
-        "funding_source": "historical" if market_type == "futures" and funding_rates is not None and actual_funding.abs().sum() > 0 else ("assumption" if market_type == "futures" else "none"),
+        "funding_source": funding_source,
+        "funding_events": int((actual_funding != 0).sum()) if market_type == "futures" else 0,
         "leverage": float(effective_leverage),
         "market_type": market_type,
         "liquidation_events": int(liquidation_events.sum()),
