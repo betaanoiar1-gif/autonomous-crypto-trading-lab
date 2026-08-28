@@ -19,7 +19,8 @@ from .run import (
     _score,
     _status,
 )
-from .fast_evaluator import evaluate_fixed, frozen_confirmation
+from .fast_evaluator import evaluate_fixed
+from .evaluator import frozen_confirmation
 
 MAX_WORKERS = 4
 
