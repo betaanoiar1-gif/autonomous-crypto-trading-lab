@@ -1,14 +1,11 @@
 from __future__ import annotations
-
-from dataclasses import dataclass
 import itertools
 import numpy as np
 import pandas as pd
-
+from dataclasses import dataclass
 from ..backtest.engine import run_ohlcv
 from ..metrics import sharpe, sortino
 from .executor import compile_signal
-
 
 @dataclass
 class Evaluation:
@@ -18,19 +15,16 @@ class Evaluation:
     passed: bool
     rejection_reasons: list[str]
 
-
 def _metrics(result, returns: pd.Series) -> dict:
     active = result.trades["position"].diff().abs().fillna(result.trades["position"].abs()) > 0
     return {**result.metrics, "sharpe": sharpe(returns), "sortino": sortino(returns),
             "win_rate": float((returns[returns != 0] > 0).mean()) if (returns != 0).any() else 0.0,
             "trade_count": int(active.sum())}
 
-
 def _run(df, family, params, directions, capital, fee_bps, slippage_bps, market_type="spot", leverage=1.0, funding_rates=None):
     sig = compile_signal(df, family, params, directions)
     return run_ohlcv(df, sig, capital, fee_bps, slippage_bps, market_type=market_type,
                      leverage=leverage, funding_rates=funding_rates)
-
 
 def _param_grid(family: str, base: dict) -> list[dict]:
     family = family.lower().strip()
@@ -60,13 +54,11 @@ def _param_grid(family: str, base: dict) -> list[dict]:
         return [{"channel_length": v} for v in vals]
     return [dict(base)]
 
-
 def _training_objective(metrics: dict) -> float:
     trades = int(metrics.get("trade_count", 0))
     if trades < 4: return -10.0 + trades * 0.25
     ret = float(metrics.get("total_return", 0.0)); pf = min(3.0, float(metrics.get("profit_factor", 0.0))); dd = abs(min(0.0, float(metrics.get("max_drawdown", 0.0)))); sh = float(metrics.get("sharpe", 0.0))
     return 100.0 * ret + 3.0 * pf + 2.0 * sh - 15.0 * dd
-
 
 def _select_params(train, family, base_params, directions, capital, fee_bps, slippage_bps, market_type="spot", leverage=1.0, funding_rates=None):
     best = None; leaderboard = []
@@ -76,7 +68,6 @@ def _select_params(train, family, base_params, directions, capital, fee_bps, sli
         if best is None or score > best[0]: best = (score, candidate, metrics)
     leaderboard.sort(key=lambda x: x["score"], reverse=True)
     return (dict(best[1]), {"selected": dict(best[1]), "selected_score": float(best[0]), "candidates": leaderboard[:5]}) if best else (dict(base_params), {"selected": dict(base_params), "candidates": []})
-
 
 def _walk_forward(df, family, base_params, directions, capital, fee_bps, slippage_bps, windows=4, market_type="spot", leverage=1.0, funding_rates=None):
     n = len(df)
@@ -93,11 +84,9 @@ def _walk_forward(df, family, base_params, directions, capital, fee_bps, slippag
     rets = np.array([r["total_return"] for r in rows]); sharpes = np.array([r["sharpe"] for r in rows]); trades = np.array([r["trade_count"] for r in rows]); positive = int((rets > 0).sum())
     return {"windows": rows, "positive_windows": positive, "positive_ratio": float(positive / len(rows)), "median_return": float(np.median(rets)), "worst_return": float(np.min(rets)), "median_sharpe": float(np.median(sharpes)), "min_trade_count": int(np.min(trades)), "passed": bool(len(rows) >= 3 and positive / len(rows) >= 0.75 and np.median(rets) > 0 and np.min(trades) >= 4), "mode": "tuned"}
 
-
 def _research_score(oos, walk):
     ret = float(oos.get("total_return", 0)); sh = float(oos.get("sharpe", 0)); dd = abs(min(0.0, float(oos.get("max_drawdown", 0)))); wf = float(walk.get("median_return", 0)); wf_sh = float(walk.get("median_sharpe", 0))
     return float(100 * ret + 5 * sh + 75 * wf + 2 * wf_sh - 20 * dd)
-
 
 def evaluate(df, family, params, directions, initial_capital, fee_bps, slippage_bps, holdout_ratio=0.30,
              market_type="spot", leverage=1.0, funding_rates=None):
@@ -131,3 +120,28 @@ def evaluate(df, family, params, directions, initial_capital, fee_bps, slippage_
     if market_type == "futures" and om.get("funding_source") != "historical": reasons.append("Missing historical funding rates")
     if market_type == "futures" and om.get("liquidation_events", 0) > 0: reasons.append("Liquidation event detected")
     return Evaluation(im, om, robust, not reasons, reasons)
+
+def frozen_confirmation(df, family, params, directions, initial_capital, fee_bps, slippage_bps, market_type="spot", leverage=1.0, funding_rates=None):
+    """Run a frozen-parameter confirmation on an independent market slice.
+
+    No parameter search, optimization, or adaptation occurs here. The input
+    `params` must be the parameters selected before this confirmation stage.
+    """
+    if len(df) < 240:
+        raise ValueError("Not enough observations for independent confirmation; need at least 240")
+    result = _run(df, family, dict(params), directions, initial_capital, fee_bps, slippage_bps, market_type, leverage, funding_rates)
+    metrics = _metrics(result, result.returns)
+    passed = bool(
+        metrics["trade_count"] >= 8
+        and metrics["total_return"] > 0
+        and metrics["profit_factor"] > 1.0
+        and metrics["max_drawdown"] >= -0.50
+    )
+    reasons = []
+    if metrics["trade_count"] < 8: reasons.append("Too few confirmation trades")
+    if metrics["total_return"] <= 0: reasons.append("Non-positive confirmation return")
+    if metrics["profit_factor"] <= 1: reasons.append("Confirmation profit factor <= 1")
+    if metrics["max_drawdown"] < -0.50: reasons.append("Confirmation drawdown exceeds 50%")
+    if market_type == "futures" and metrics.get("funding_source") != "historical": reasons.append("Missing historical funding rates")
+    if market_type == "futures" and metrics.get("liquidation_events", 0) > 0: reasons.append("Liquidation event detected")
+    return {"metrics": metrics, "passed": passed, "rejection_reasons": reasons, "parameters": dict(params), "market_type": market_type}
