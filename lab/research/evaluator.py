@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import itertools
 import numpy as np
 import pandas as pd
 
@@ -35,22 +36,90 @@ def _run(df, family, params, directions, capital, fee_bps, slippage_bps):
     return run_ohlcv(df, sig, capital, fee_bps, slippage_bps)
 
 
-def _walk_forward(df, family, params, directions, capital, fee_bps, slippage_bps, windows=4):
+def _param_grid(family: str, base: dict) -> list[dict]:
+    """Small, bounded grids to limit tuning overfit while allowing re-selection per fold."""
+    family = family.lower().strip()
+    if family in {"momentum", "breakout"}:
+        b = int(base.get("lookback", 20))
+        vals = sorted({max(2, min(200, int(b * f))) for f in (0.5, 0.75, 1.0, 1.25, 1.5)})
+        return [{"lookback": v} for v in vals]
+    if family == "mean_reversion":
+        b = int(base.get("lookback", 40))
+        ze = float(base.get("z_entry", 1.5))
+        zx = float(base.get("z_exit", 0.25))
+        lookbacks = sorted({max(10, min(200, int(b * f))) for f in (0.75, 1.0, 1.25)})
+        entries = sorted({round(max(0.8, min(3.5, ze * f)), 3) for f in (0.85, 1.0, 1.15)})
+        exits = sorted({round(max(0.05, min(1.5, zx * f)), 3) for f in (0.75, 1.0, 1.25)})
+        grid = []
+        for n, e, x in itertools.product(lookbacks, entries, exits):
+            if x < e:
+                grid.append({"lookback": n, "z_entry": e, "z_exit": x})
+        return grid[:15]
+    if family == "moving_average_cross":
+        fast = int(base.get("fast", 10))
+        slow = int(base.get("slow", 40))
+        fasts = sorted({max(2, min(100, int(fast * f))) for f in (0.75, 1.0, 1.25)})
+        slows = sorted({max(3, min(300, int(slow * f))) for f in (0.75, 1.0, 1.25, 1.5)})
+        grid = []
+        for f, s in itertools.product(fasts, slows):
+            if s > f:
+                grid.append({"fast": f, "slow": s})
+        return grid[:12]
+    return [dict(base)]
+
+
+def _training_objective(metrics: dict) -> float:
+    """Reward return and quality, penalize drawdown and tiny samples."""
+    trades = int(metrics.get("trade_count", 0))
+    if trades < 4:
+        return -10.0 + trades * 0.25
+    ret = float(metrics.get("total_return", 0.0))
+    pf = min(3.0, float(metrics.get("profit_factor", 0.0)))
+    dd = abs(min(0.0, float(metrics.get("max_drawdown", 0.0))))
+    sh = float(metrics.get("sharpe", 0.0))
+    return 100.0 * ret + 3.0 * pf + 2.0 * sh - 15.0 * dd
+
+
+def _select_params(train, family, base_params, directions, capital, fee_bps, slippage_bps):
+    best = None
+    leaderboard = []
+    for candidate in _param_grid(family, base_params):
+        result = _run(train, family, candidate, directions, capital, fee_bps, slippage_bps)
+        metrics = _metrics(result, result.returns)
+        score = _training_objective(metrics)
+        leaderboard.append({"parameters": candidate, "score": float(score), "metrics": metrics})
+        if best is None or score > best[0]:
+            best = (score, candidate, metrics)
+    leaderboard.sort(key=lambda x: x["score"], reverse=True)
+    if best is None:
+        return dict(base_params), {"selected": dict(base_params), "candidates": []}
+    return dict(best[1]), {"selected": dict(best[1]), "selected_score": float(best[0]), "candidates": leaderboard[:5]}
+
+
+def _walk_forward(df, family, base_params, directions, capital, fee_bps, slippage_bps, windows=4):
     n = len(df)
     if n < 240:
-        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0, "median_sharpe": 0.0, "min_trade_count": 0, "passed": False}
-    train_size = max(120, int(n * 0.45))
+        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0,
+                "median_sharpe": 0.0, "min_trade_count": 0, "passed": False, "mode": "tuned"}
+
+    train_size = max(160, int(n * 0.45))
     test_size = max(40, int((n - train_size) / windows))
     rows = []
     start = 0
     while len(rows) < windows and start + train_size + test_size <= n:
+        train = df.iloc[start:start + train_size]
         test = df.iloc[start + train_size:start + train_size + test_size]
-        result = _run(test, family, params, directions, capital, fee_bps, slippage_bps)
+        selected, tuning = _select_params(train, family, base_params, directions, capital, fee_bps, slippage_bps)
+        result = _run(test, family, selected, directions, capital, fee_bps, slippage_bps)
         m = _metrics(result, result.returns)
         rows.append({
             "fold": len(rows) + 1,
-            "start": str(test.index[0]),
-            "end": str(test.index[-1]),
+            "train_start": str(train.index[0]),
+            "train_end": str(train.index[-1]),
+            "test_start": str(test.index[0]),
+            "test_end": str(test.index[-1]),
+            "selected_parameters": selected,
+            "tuning": tuning,
             "total_return": float(m["total_return"]),
             "max_drawdown": float(m["max_drawdown"]),
             "profit_factor": float(m["profit_factor"]),
@@ -58,8 +127,11 @@ def _walk_forward(df, family, params, directions, capital, fee_bps, slippage_bps
             "trade_count": int(m["trade_count"]),
         })
         start += test_size
+
     if not rows:
-        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0, "median_sharpe": 0.0, "min_trade_count": 0, "passed": False}
+        return {"windows": [], "positive_windows": 0, "median_return": 0.0, "positive_ratio": 0.0,
+                "median_sharpe": 0.0, "min_trade_count": 0, "passed": False, "mode": "tuned"}
+
     rets = np.array([r["total_return"] for r in rows], dtype=float)
     sharpes = np.array([r["sharpe"] for r in rows], dtype=float)
     trades = np.array([r["trade_count"] for r in rows], dtype=float)
@@ -77,6 +149,7 @@ def _walk_forward(df, family, params, directions, capital, fee_bps, slippage_bps
         "median_sharpe": float(np.median(sharpes)),
         "min_trade_count": min_trades,
         "passed": passed,
+        "mode": "tuned",
     }
 
 
