@@ -12,17 +12,17 @@ from .prompt import build_prompt, SYSTEM as RESEARCH_SYSTEM
 from .evaluator import evaluate
 
 
-def _safe_agent_hypotheses(agent, snapshot, max_hypotheses, prior_failures):
-    prompt = build_prompt(snapshot, prior_failures, max_hypotheses)
+def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses):
+    prompt = build_prompt(snapshot, prior_failures, 1, prior_hypotheses)
     text = agent.chat(prompt, system=RESEARCH_SYSTEM)
     try:
-        return parse_hypotheses(text)
-    except ValueError:
+        return parse_hypotheses(text)[0]
+    except (ValueError, IndexError):
         retry = (
-            "Repeat the task using the exact line format specified in the prompt. "
-            "Return only hypothesis blocks ending with END. Do not output JSON, markdown, or analysis.\n\n" + prompt
+            "Return exactly ONE hypothesis block using the required line format. "
+            "End with END. No JSON, markdown, analysis, or commentary.\n\n" + prompt
         )
-        return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))
+        return parse_hypotheses(agent.chat(retry, system=RESEARCH_SYSTEM))[0]
 
 
 def _load_failures(path):
@@ -74,9 +74,22 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
 
     print(f"Data source: {exchange_id} | {timeframe} | {symbols}")
     agent = agent or LocalAgent()
-    hypotheses = _safe_agent_hypotheses(agent, snapshot, max_hypotheses, prior_failures)
-    print(f"Hypotheses generated: {len(hypotheses)}")
+    hypotheses = []
+    for attempt in range(max_hypotheses):
+        try:
+            hypothesis = _safe_one_hypothesis(agent, snapshot, prior_failures, [h.model_dump() for h in hypotheses])
+            signature = (hypothesis.executable_family, tuple(hypothesis.directions), tuple(hypothesis.symbols), hypothesis.thesis.strip().lower())
+            existing = [
+                (h.executable_family, tuple(h.directions), tuple(h.symbols), h.thesis.strip().lower())
+                for h in hypotheses
+            ]
+            if signature in existing:
+                continue
+            hypotheses.append(hypothesis)
+        except Exception as exc:
+            print(f"Hypothesis generation {attempt + 1} failed: {exc}")
 
+    print(f"Hypotheses generated: {len(hypotheses)}")
     records = []
     for idx, hypothesis in enumerate(hypotheses):
         symbol = next((s for s in hypothesis.symbols if s in market), symbols[0])
@@ -91,49 +104,32 @@ def run(max_hypotheses: int = 4, agent=None) -> dict:
                 settings.execution.slippage_bps,
                 settings.validation.holdout_ratio,
             )
-            passed = evaluation.passed
             record = {
-                "run_id": run_id,
-                "index": idx,
-                "symbol": symbol,
-                "timeframe": timeframe,
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
                 "hypothesis": hypothesis.model_dump(),
-                "status": "VALIDATION_CANDIDATE" if passed else "REJECTED",
-                "in_sample": evaluation.in_sample,
-                "out_of_sample": evaluation.out_of_sample,
-                "robustness": evaluation.robustness,
-                "rejection_reasons": evaluation.rejection_reasons,
+                "status": "VALIDATION_CANDIDATE" if evaluation.passed else "REJECTED",
+                "in_sample": evaluation.in_sample, "out_of_sample": evaluation.out_of_sample,
+                "robustness": evaluation.robustness, "rejection_reasons": evaluation.rejection_reasons,
             }
-            if passed and settings.output.generate_pine:
-                allow_short = any(d in {"short", "both"} for d in directions)
+            if evaluation.passed and settings.output.generate_pine:
                 pine = build_pine(
-                    f"ACL {hypothesis.title[:50]}",
-                    family,
-                    hypothesis.executable_parameters,
-                    allow_short=allow_short,
+                    f"ACL {hypothesis.title[:50]}", family, hypothesis.executable_parameters,
+                    allow_short=any(d in {"short", "both"} for d in directions),
                 )
-                (out / f"candidate_{idx+1}.pine").write_text(pine, encoding="utf-8")
-                record["pine_path"] = str(out / f"candidate_{idx+1}.pine")
+                (out / f"candidate_{idx + 1}.pine").write_text(pine, encoding="utf-8")
+                record["pine_path"] = str(out / f"candidate_{idx + 1}.pine")
         except Exception as exc:
             record = {
-                "run_id": run_id,
-                "index": idx,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "hypothesis": hypothesis.model_dump(),
-                "status": "REJECTED",
-                "error": str(exc),
+                "run_id": run_id, "index": idx, "symbol": symbol, "timeframe": timeframe,
+                "hypothesis": hypothesis.model_dump(), "status": "REJECTED", "error": str(exc),
             }
         records.append(record)
-        print(f"[{idx+1}/{len(hypotheses)}] {hypothesis.title} -> {record['status']}")
+        print(f"[{idx + 1}/{len(hypotheses)}] {hypothesis.title} -> {record['status']}")
 
     manifest = {
-        "run_id": run_id,
-        "created_at": now.isoformat(),
-        "capital": settings.capital.model_dump(),
-        "market_snapshot": snapshot,
-        "hypothesis_count": len(hypotheses),
-        "records": records,
+        "run_id": run_id, "created_at": now.isoformat(),
+        "capital": settings.capital.model_dump(), "market_snapshot": snapshot,
+        "hypothesis_count": len(hypotheses), "records": records,
     }
     (out / "run.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     memory_path.parent.mkdir(parents=True, exist_ok=True)
