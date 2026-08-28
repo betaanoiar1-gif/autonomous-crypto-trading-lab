@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import time
 
 from ..config import ROOT, load_settings
 from ..data.ccxt_adapter import CCXTMarketData
@@ -28,6 +29,12 @@ DIVERSITY_SLOTS = [
 ]
 SUPPORTED_TIMEFRAMES = ["15m", "1h", "4h"]
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
+
+# Cache market snapshots across autonomous cycles in the same process.
+# 15 minutes keeps the 10-cycle autonomous loop fast without making a new launch stale.
+_MARKET_CACHE = None
+_MARKET_CACHE_AT = 0.0
+_MARKET_CACHE_TTL_SECONDS = 15 * 60
 
 
 def _safe_one_hypothesis(agent, snapshot, prior_failures, prior_hypotheses, slot):
@@ -178,14 +185,11 @@ def _next_timeframe(timeframe):
     return SUPPORTED_TIMEFRAMES[i + 1] if i + 1 < len(SUPPORTED_TIMEFRAMES) else SUPPORTED_TIMEFRAMES[i - 1] if i > 0 else None
 
 
-def run(max_hypotheses: int = 12, agent=None) -> dict:
-    settings = load_settings()
-    now = datetime.now(timezone.utc)
-    run_id = now.strftime("RUN-%Y%m%dT%H%M%SZ")
-    out = ROOT / "experiments" / run_id
-    out.mkdir(parents=True, exist_ok=False)
-    memory_path = ROOT / "experiments" / "memory.jsonl"
-    prior_failures = _load_failures(memory_path)
+def _fetch_markets_cached():
+    global _MARKET_CACHE, _MARKET_CACHE_AT
+    now_mono = time.monotonic()
+    if _MARKET_CACHE is not None and (now_mono - _MARKET_CACHE_AT) < _MARKET_CACHE_TTL_SECONDS:
+        return _MARKET_CACHE
 
     spot_adapter = CCXTMarketData(exchange_id="binance")
     spot_market = spot_adapter.fetch_multi_timeframes(SYMBOLS, SUPPORTED_TIMEFRAMES, limit=1500, market_type="spot")
@@ -210,14 +214,31 @@ def run(max_hypotheses: int = 12, agent=None) -> dict:
         "futures_available": isinstance(futures_market, dict) and not futures_error,
         "futures_observations": ({f"{s}@{tf}": len(df) for (s, tf), df in futures_market.items()} if isinstance(futures_market, dict) else {}),
     }
+    _MARKET_CACHE = (spot_market, futures_market, futures_funding, futures_error, snapshot)
+    _MARKET_CACHE_AT = now_mono
+    return _MARKET_CACHE
+
+
+def run(max_hypotheses: int = 12, agent=None) -> dict:
+    settings = load_settings()
+    now = datetime.now(timezone.utc)
+    run_id = now.strftime("RUN-%Y%m%dT%H%M%SZ")
+    out = ROOT / "experiments" / run_id
+    out.mkdir(parents=True, exist_ok=False)
+    memory_path = ROOT / "experiments" / "memory.jsonl"
+    prior_failures = _load_failures(memory_path)
+
+    spot_market, futures_market, futures_funding, futures_error, snapshot = _fetch_markets_cached()
     print(f"Data source: binance | timeframes={SUPPORTED_TIMEFRAMES} | symbols={SYMBOLS}")
     print(f"Spot observations: {sum(snapshot['observations_spot'].values())} total rows across pairs/factors")
     if isinstance(futures_market, dict) and not futures_error:
-        print(f"Futures data: connected | historical funding loaded | events={sum(len(v) for v in futures_funding.values())}")
+        print(f"Futures data: connected | historical funding loaded | events={sum(len(v) for v in futures_funding.values())} | cache=active")
     elif futures_error:
         print(f"Futures data: unavailable -> {futures_error}")
-    agent = agent or LocalAgent()
+    else:
+        print("Futures data: unavailable | cache=active")
 
+    agent = agent or LocalAgent()
     hypotheses = []
     target = min(max_hypotheses, len(DIVERSITY_SLOTS))
     print(f"Research slots requested: {target}")
