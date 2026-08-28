@@ -3,42 +3,41 @@ import json
 
 SYSTEM = """
 You are the autonomous research scientist inside a crypto trading research laboratory.
-Propose falsifiable trading hypotheses, not promises of profit.
-You may choose assets, timeframes, spot/futures, long/short and research methods.
-External claims are hypothesis inputs, never proof. Prefer simple, testable ideas.
-Avoid look-ahead bias, leakage and retrospective rule changes.
-For executable testing, express each hypothesis with one supported family and numeric parameters.
-Return STRICT JSON only. No markdown or prose outside JSON.
+Generate diverse, falsifiable crypto trading hypotheses. Never promise profits.
+Do not invent market data, test results, or sources. External information is only input for hypotheses.
+The local model is small, so use this SIMPLE LINE FORMAT and nothing else.
+For each hypothesis output one block:
+TITLE: ...
+THESIS: ...
+FAMILY: momentum|mean_reversion|breakout|moving_average_cross
+DIRECTION: long|short|both
+TIMEFRAME: 1h
+SYMBOL: BTC/USDT or ETH/USDT
+LOOKBACK: integer
+FAST: integer
+SLOW: integer
+Z_ENTRY: number
+Z_EXIT: number
+FALSIFY: one sentence
+END
+Do not output JSON, markdown, code fences, analysis, or commentary.
 """.strip()
 
 SUPPORTED_FAMILIES = ["momentum", "mean_reversion", "breakout", "moving_average_cross"]
 
 
-def build_prompt(market_snapshot: dict, prior_failures: list[dict], max_hypotheses: int = 5) -> str:
+def build_prompt(market_snapshot: dict, prior_failures: list[dict], max_hypotheses: int = 4) -> str:
     payload = {
         "task": "Generate diverse crypto trading hypotheses for independent backtesting.",
         "market_snapshot": market_snapshot,
-        "prior_failures": prior_failures[-20:],
+        "prior_failures": prior_failures[-10:],
         "max_hypotheses": max_hypotheses,
-        "supported_executable_families": SUPPORTED_FAMILIES,
+        "families": SUPPORTED_FAMILIES,
         "parameter_rules": {
-            "momentum": {"lookback": "int 2..200"},
-            "mean_reversion": {"lookback": "int 2..200", "z_entry": "float 0.5..4", "z_exit": "float 0..2"},
-            "breakout": {"lookback": "int 2..200"},
-            "moving_average_cross": {"fast": "int 2..100", "slow": "int 3..300, slow > fast"}
+            "momentum": "LOOKBACK 2..200",
+            "mean_reversion": "LOOKBACK 2..200; Z_ENTRY 0.5..4; Z_EXIT 0..2",
+            "breakout": "LOOKBACK 2..200",
+            "moving_average_cross": "FAST 2..100; SLOW FAST+1..300",
         },
-        "required_schema": {"hypotheses": [{
-            "title": "string",
-            "thesis": "string",
-            "market_types": ["spot"],
-            "directions": ["long"],
-            "timeframes": ["1h"],
-            "symbols": ["BTC/USDT"],
-            "rules": ["explicit rules"],
-            "novelty": "string",
-            "falsification_plan": ["specific attacks"],
-            "executable_family": "one supported family",
-            "executable_parameters": {"family-specific numeric parameters": "value"}
-        }]}
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False)
