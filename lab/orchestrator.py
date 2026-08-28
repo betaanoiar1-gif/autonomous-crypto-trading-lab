@@ -12,7 +12,7 @@ def run(agent=None) -> None:
         return
 
     from .research.run import DIVERSITY_SLOTS
-    from .research.fast_run import run as research_run
+    from .research.ultra_run import run as research_run
 
     cycles = max(1, int(getattr(settings.research, "max_autonomous_cycles", 10)))
     target = min(int(settings.research.max_experiments_per_run), len(DIVERSITY_SLOTS))
