@@ -7,7 +7,6 @@ import time
 import ccxt
 import pandas as pd
 
-
 _TIMEFRAME_MS = {
     "1m": 60_000,
     "5m": 5 * 60_000,
@@ -45,8 +44,6 @@ class CCXTMarketData:
         numeric = ["open", "high", "low", "close", "volume"]
         df[numeric] = df[numeric].astype(float)
 
-        # Never use pandas floor() with calendar frequencies such as MonthEnd.
-        # Remove the currently forming candle by comparing its age in milliseconds.
         interval_ms = _TIMEFRAME_MS[timeframe]
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         last_open_ms = int(df.index[-1].timestamp() * 1000)
@@ -64,7 +61,7 @@ class CCXTMarketData:
         self,
         symbols: list[str],
         timeframes: list[str],
-        limit: int = 1000,
+        limit: int = 1500,
     ) -> dict[tuple[str, str], pd.DataFrame]:
         out: dict[tuple[str, str], pd.DataFrame] = {}
         for timeframe in timeframes:
