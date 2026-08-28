@@ -1,27 +1,23 @@
-from pathlib import Path
-from datetime import datetime, timezone
-import json
-from .config import ROOT, load_settings
+from __future__ import annotations
+
+from .config import load_settings
 
 
 def run() -> None:
     settings = load_settings()
-    run_id = datetime.now(timezone.utc).strftime("RUN-%Y%m%dT%H%M%SZ")
-    exp_dir = ROOT / "experiments" / run_id
-    exp_dir.mkdir(parents=True, exist_ok=False)
-    manifest = {
-        "run_id": run_id,
-        "status": "BOOTSTRAPPED",
-        "capital": settings.capital.model_dump(),
-        "research": settings.research.model_dump(),
-        "execution": settings.execution.model_dump(),
-        "validation": settings.validation.model_dump(),
-        "note": "Research adapters and autonomous-agent runtime are intentionally separated from the controller.",
-    }
-    (exp_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"LAB READY: {run_id}")
+    print("LAB READY")
     print(f"Initial capital: ${settings.capital.initial_usd:,.2f}")
-    print("Next layer: data + research agent + backtest + validation adapters.")
+    if settings.research.autonomous:
+        print("Starting autonomous research cycle...")
+        from .research.run import run as research_run
+        result = research_run(max_hypotheses=min(4, settings.research.max_experiments_per_run))
+        statuses = [r.get("status", "UNKNOWN") for r in result["records"]]
+        print(f"Research run: {result['run_id']}")
+        print(f"Hypotheses generated: {result['hypothesis_count']}")
+        print(f"Statuses: {statuses}")
+        print("Results saved under experiments/")
+    else:
+        print("Autonomous research is disabled in configuration.")
 
 
 if __name__ == "__main__":
