@@ -102,7 +102,6 @@ def _signal(df: pd.DataFrame, idea: Idea) -> pd.Series:
         loss = (-delta.clip(upper=0)).ewm(alpha=1 / length, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
-        # Buy pullbacks only while trend is up; short pullbacks only while trend is down.
         out[(rsi < low) & (close > ema)] = 1.0
         out[(rsi > high) & (close < ema)] = -1.0
 
@@ -123,7 +122,6 @@ def _signal(df: pd.DataFrame, idea: Idea) -> pd.Series:
     else:
         raise ValueError(f"Unknown research idea: {name}")
 
-    # Decisions use only information known before the bar being traded.
     return out.shift(1).fillna(0.0)
 
 
@@ -138,7 +136,6 @@ def _evaluate_idea(df: pd.DataFrame, idea: Idea, settings):
     train_metrics = _metrics(train_result, train_result.returns)
     test_metrics = _metrics(test_result, test_result.returns)
 
-    # Four contiguous holdout-like blocks, with the same frozen idea.
     block_size = len(test) // 4
     folds = []
     for i in range(4):
@@ -285,7 +282,7 @@ def run() -> dict:
     print("=== FROZEN INDEPENDENT TEST ===", flush=True)
     independent_result = _independent(independent, frozen, settings)
     print(
-        f"Frozen {frozen.idea} {frozen.params} | "
+        f"Frozen {frozen.name} {frozen.params} | "
         f"BTC/USDT 4h return={independent_result['total_return']:.2%} | "
         f"PF={independent_result['profit_factor']:.2f} | "
         f"DD={independent_result['max_drawdown']:.2%} | "
