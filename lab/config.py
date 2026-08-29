@@ -17,15 +17,16 @@ class ResearchConfig(BaseModel):
     require_independent_validation: bool = True
 
 class ExecutionConfig(BaseModel):
+    # Research defaults are spot-only, long/flat, and unlevered.
     allow_spot: bool = True
-    allow_futures: bool = True
+    allow_futures: bool = False
     allow_long: bool = True
-    allow_short: bool = True
-    allow_leverage: bool = True
-    max_leverage: float = 3.0
+    allow_short: bool = False
+    allow_leverage: bool = False
+    max_leverage: float = 1.0
     commission_bps: float = 10.0
     slippage_bps: float = 5.0
-    include_funding: bool = True
+    include_funding: bool = False
 
 class ValidationConfig(BaseModel):
     holdout_ratio: float = 0.30
