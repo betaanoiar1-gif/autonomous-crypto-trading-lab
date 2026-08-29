@@ -117,7 +117,10 @@ def _score(df:pd.DataFrame,g:Genome,settings,market:str)->Score:
     oos=df.iloc[-8000:].copy() if len(df)>8000 else df.copy()
     sig=_signal(oos,g); m=_metrics(oos,sig,settings); st=_metrics(oos,sig,settings,2.0)
     wfmed,wfpos=_wf(df,g,settings)
-    return Score(g,market,float(m["total_return"]),float(m["profit_factor"]),float(m["max_drawdown"]),int(m["trade_count"]),float(m["sharpe"]),float(m["trade_turnover"]),float(st["total_return"]),float(st["profit_factor"]),wfmed,wfpos)
+    # The current backtest engine exposes no Sharpe metric. Keep the Score schema
+    # stable and use 0.0 rather than failing discovery on a non-essential field.
+    sharpe=float(m.get("sharpe", 0.0))
+    return Score(g,market,float(m["total_return"]),float(m["profit_factor"]),float(m["max_drawdown"]),int(m["trade_count"]),sharpe,float(m["trade_turnover"]),float(st["total_return"]),float(st["profit_factor"]),wfmed,wfpos)
 
 def _utility(s:Score)->float:
     return (80*s.ret + 12*max(0,s.pf-1) + 30*s.wf_median + 10*s.wf_positive + 8*max(0,s.stress_ret) - 25*max(0,-s.dd-0.08) - 12*max(0,-s.stress_ret) - 0.002*s.turnover)
