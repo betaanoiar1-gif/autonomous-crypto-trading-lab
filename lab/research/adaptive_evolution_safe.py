@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Checkpoint-first AI-free evolutionary search.
-
-This runner writes a checkpoint before any market download, performs a small
-smoke test, then evolves implemented strategy families. No LLM, futures, live
-trading, or arbitrary code execution is used.
-"""
+"""Checkpoint-first AI-free evolutionary search."""
 
 import gc
 import json
@@ -66,8 +61,8 @@ def _mutate(rng: random.Random, family: str, params: dict) -> dict:
         p["slow"] = max(p["fast"] + 3, min(300, int(round(p["slow"] * mult))))
     elif family == "rsi_reversion":
         p["rsi_length"] = max(3, min(50, int(round(p["rsi_length"] * mult))))
-        p["rsi_low"] = max(5, min(45, p["rsi_low"] + rng.choice((-5, 0, 5)))
-        p["rsi_high"] = max(55, min(95, p["rsi_high"] + rng.choice((-5, 0, 5)))
+        p["rsi_low"] = max(5, min(45, p["rsi_low"] + rng.choice((-5, 0, 5))))
+        p["rsi_high"] = max(55, min(95, p["rsi_high"] + rng.choice((-5, 0, 5))))
     elif family == "atr_breakout":
         p["atr_length"] = max(2, min(50, int(round(p["atr_length"] * mult))))
         p["atr_mult"] = round(max(0.25, min(5.0, p["atr_mult"] * rng.choice((0.8, 1.0, 1.2)))), 3)
@@ -82,10 +77,8 @@ def _eval(df, family, params, settings, fee_mult=1.0):
 
 
 def _score(m: dict) -> float:
-    ret = float(m.get("total_return", 0.0))
-    pf = float(m.get("profit_factor", 0.0))
-    dd = abs(min(0.0, float(m.get("max_drawdown", 0.0))))
-    trades = int(m.get("trade_count", 0))
+    ret = float(m.get("total_return", 0.0)); pf = float(m.get("profit_factor", 0.0))
+    dd = abs(min(0.0, float(m.get("max_drawdown", 0.0)))); trades = int(m.get("trade_count", 0))
     if trades < 4:
         return -20.0
     return 100 * ret + 20 * (min(2.5, pf) - 1) - 35 * dd + min(8.0, math.log1p(trades))
@@ -99,6 +92,7 @@ def run(hours: float = 3.0, population: int = 16, generations: int = 8):
     _save({"started_at": started.isoformat(), "updated_at": started.isoformat(), "decision": "STARTING", "generation": 0, "evaluated": 0, "seen_candidates": 0, "generator": "deterministic_evolution", "ai_generation": False, "futures": False, "live_trading": False})
     print("=== SAFE ADAPTIVE EVOLUTION ===", flush=True)
     print("AI: DISABLED | Futures: DISABLED | Live: DISABLED", flush=True)
+    print("START CHECKPOINT WRITTEN", flush=True)
 
     adapter = CCXTMarketData(exchange_id="binance")
     print("SMOKE LOAD ETH/USDT 1h", flush=True)
@@ -111,11 +105,11 @@ def run(hours: float = 3.0, population: int = 16, generations: int = 8):
 
     data = {}
     for symbol, tf, bars in (("ETH/USDT", "1h", 1800), ("ETH/USDT", "4h", 1200), ("BTC/USDT", "4h", 1200), ("BTC/USDT", "1h", 1800), ("ETH/USDT", "15m", 1800)):
-        if time.monotonic() >= deadline:
-            break
+        if time.monotonic() >= deadline: break
         print(f"LOAD {symbol} {tf}", flush=True)
         data[(symbol, tf)] = adapter.fetch_ohlcv_history(symbol, tf, bars, page_limit=1200, market_type="spot")
         print(f"  bars={len(data[(symbol, tf)])}", flush=True)
+        _save({"started_at": started.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "decision": "LOADING", "loaded_market": f"{symbol} {tf}", "loaded_bars": len(data[(symbol, tf)])})
         gc.collect()
 
     rng = random.Random(20260829)
@@ -127,95 +121,81 @@ def run(hours: float = 3.0, population: int = 16, generations: int = 8):
             key = (fam, tuple(sorted(par.items())))
             if key not in seen:
                 seen.add(key); pop.append((fam, dict(par)))
-            if len(pop) >= population:
-                break
+            if len(pop) >= population: break
+        if len(pop) >= population: break
 
-    records = []
+    results = []
     total_evaluated = 0
     primary_keys = (("ETH/USDT", "1h"), ("ETH/USDT", "4h"), ("BTC/USDT", "4h"))
 
     for gen in range(1, generations + 1):
-        if time.monotonic() >= deadline:
-            break
+        if time.monotonic() >= deadline: break
         print(f"\n=== GENERATION {gen}/{generations} ===", flush=True)
-        current = []
-        for i, (fam, par) in enumerate(pop, 1):
-            if time.monotonic() >= deadline:
-                break
-            ms = []
+        gen_results = []
+        for i, (fam, params) in enumerate(pop, 1):
+            if time.monotonic() >= deadline: break
+            market_scores = []
+            ok = 0
             for key in primary_keys:
-                ms.append(_eval(data[key], fam, par, settings))
-            rets = [float(m["total_return"]) for m in ms]
-            positive = sum(float(m["total_return"]) > 0 and float(m["profit_factor"]) > 1 and int(m["trade_count"]) >= 8 for m in ms)
-            value = float(np.mean([_score(m) for m in ms]) + 18 * positive - 22 * (max(rets) - min(rets)))
-            current.append({"family": fam, "params": par, "score": value, "positive": positive, "markets": ms})
-            total_evaluated += 1
-            if i == 1 or i % 2 == 0:
-                print(f"eval {i}/{len(pop)} | score={value:.2f} | positive={positive}/3 | {fam} {par}", flush=True)
-            _save({"started_at": started.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "decision": "RUNNING", "generation": gen, "evaluated": total_evaluated, "seen_candidates": len(seen), "best_score": max(x["score"] for x in current)})
+                m = _eval(data[key], fam, params, settings, 1.0)
+                market_scores.append(m)
+                ok += int(m["total_return"] > 0 and m["profit_factor"] > 1 and m["trade_count"] >= 8)
+            rets = [float(m["total_return"]) for m in market_scores]
+            value = float(np.mean([_score(m) for m in market_scores]) + 20 * ok - 20 * (max(rets) - min(rets)))
+            rec = {"family": fam, "params": dict(params), "title": fam + " | " + str(params), "score": value, "ok": ok, "markets": market_scores}
+            gen_results.append(rec); results.append(rec); total_evaluated += 1
+            _save({"started_at": started.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "decision": "RUNNING", "generation": gen, "evaluated": total_evaluated, "seen_candidates": len(seen), "latest": rec})
+            print(f"eval {i}/{len(pop)} | score={value:.2f} | ok={ok}/3 | {rec['title']}", flush=True)
             gc.collect()
-
-        if not current:
-            break
-        current.sort(key=lambda x: (x["positive"], x["score"]), reverse=True)
-        records.extend(current[:6])
-        best = current[0]
-        print(f"GENERATION RESULT: best={best['score']:.2f} | positive={best['positive']}/3", flush=True)
-
-        elite_n = max(2, min(5, len(current)))
-        elites = current[:elite_n]
+        if not gen_results: break
+        gen_results.sort(key=lambda x: (x["ok"], x["score"]), reverse=True)
+        best = gen_results[0]
+        print(f"GENERATION RESULT: best={best['score']:.2f} | ok={best['ok']}/3", flush=True)
+        elite_n = max(2, min(6, population // 3)); elites = gen_results[:elite_n]
         next_pop = [(x["family"], dict(x["params"])) for x in elites]
         while len(next_pop) < population and time.monotonic() < deadline:
-            parent = rng.choice(elites)
-            child = (parent["family"], _mutate(rng, parent["family"], parent["params"]))
-            key = (child[0], tuple(sorted(child[1].items())))
+            e = rng.choice(elites)
+            child = _mutate(rng, e["family"], e["params"])
+            key = (e["family"], tuple(sorted(child.items())))
             if key not in seen:
-                seen.add(key); next_pop.append(child)
-            elif rng.random() < 0.2:
-                fam = rng.choice(FAMILIES); par = dict(rng.choice(SEEDS[fam])); key = (fam, tuple(sorted(par.items())))
-                if key not in seen:
-                    seen.add(key); next_pop.append((fam, par))
+                seen.add(key); next_pop.append((e["family"], child))
+            elif rng.random() < 0.15:
+                fam2 = rng.choice(FAMILIES); par2 = dict(rng.choice(SEEDS[fam2])); key2 = (fam2, tuple(sorted(par2.items())))
+                if key2 not in seen:
+                    seen.add(key2); next_pop.append((fam2, par2))
         pop = next_pop
-        _save({"started_at": started.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "decision": "RUNNING", "generation": gen, "evaluated": total_evaluated, "seen_candidates": len(seen), "best_family": best["family"], "best_params": best["params"], "best_score": best["score"]})
 
-    # Diverse finalists: no family can occupy more than two slots.
-    records.sort(key=lambda x: (x["positive"], x["score"]), reverse=True)
-    finalists = []
-    family_counts = {}
-    for r in records:
-        if family_counts.get(r["family"], 0) >= 2:
-            continue
-        finalists.append(r); family_counts[r["family"]] = family_counts.get(r["family"], 0) + 1
-        if len(finalists) >= 10:
-            break
+    results.sort(key=lambda x: (x["ok"], x["score"]), reverse=True)
+    finalists = []; family_count = {}
+    for r in results:
+        if family_count.get(r["family"], 0) >= 2: continue
+        finalists.append(r); family_count[r["family"]] = family_count.get(r["family"], 0) + 1
+        if len(finalists) >= 10: break
 
     print("\n=== FROZEN FRESH CONFIRMATION ===", flush=True)
-    confirmed = []
-    for i, r in enumerate(finalists, 1):
-        fam, par = r["family"], r["params"]
-        print(f"FINALIST {i}/{len(finalists)}: {fam} {par}", flush=True)
+    confirmations = []
+    for idx, r in enumerate(finalists, 1):
         fresh = []
         for key in (("BTC/USDT", "1h"), ("ETH/USDT", "15m")):
-            normal = _eval(data[key], fam, par, settings, 1.0)
-            stress = _eval(data[key], fam, par, settings, 2.0)
-            ok = bool(normal["total_return"] > 0 and normal["profit_factor"] > 1 and normal["max_drawdown"] >= -0.50 and normal["trade_count"] >= 8 and stress["total_return"] > 0 and stress["profit_factor"] > 1)
-            fresh.append({"market": f"{key[0]} {key[1]}", "normal": normal, "stress": stress, "pass": ok})
+            normal = _eval(data[key], r["family"], r["params"], settings, 1.0)
+            stress = _eval(data[key], r["family"], r["params"], settings, 2.0)
+            ok = normal["total_return"] > 0 and normal["profit_factor"] > 1 and normal["max_drawdown"] >= -0.50 and normal["trade_count"] >= 8 and stress["total_return"] > 0 and stress["profit_factor"] > 1
+            fresh.append({"market": f"{key[0]} {key[1]}", "normal": normal, "stress": stress, "pass": bool(ok)})
             print(f"  {key[0]} {key[1]}: return={normal['total_return']:.2%} PF={normal['profit_factor']:.2f} DD={normal['max_drawdown']:.2%} trades={normal['trade_count']} stress={stress['total_return']:.2%} pass={ok}", flush=True)
-        rec = {"family": fam, "parameters": par, "screen_score": r["score"], "screen_positive": r["positive"], "fresh": fresh, "validated": bool(r["positive"] == 3 and all(x["pass"] for x in fresh))}
-        confirmed.append(rec)
-        _save({"started_at": started.isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "decision": "RUNNING", "generation": generations, "evaluated": total_evaluated, "seen_candidates": len(seen), "fresh_completed": i, "finalists": len(finalists), "current": rec})
+        validated = r["ok"] == 3 and all(x["pass"] for x in fresh)
+        confirmations.append({**r, "fresh": fresh, "validated": bool(validated)})
+        print(f"FINALIST {idx}: screen={r['ok']}/3 | fresh={sum(x['pass'] for x in fresh)}/2 | validated={validated}", flush=True)
+        if validated: break
         gc.collect()
-        if rec["validated"]:
-            break
 
-    winners = [x for x in confirmed if x["validated"]]
-    decision = "VALIDATED_ALGORITHMIC_STRATEGY" if winners else "NO_VALIDATED_ALGORITHMIC_STRATEGY"
-    payload = {"started_at": started.isoformat(), "finished_at": datetime.now(timezone.utc).isoformat(), "decision": decision, "evaluated": total_evaluated, "seen_candidates": len(seen), "finalists": len(finalists), "validated_count": len(winners), "results": confirmed}
-    _save(payload)
+    validated = [x for x in confirmations if x["validated"]]
+    decision = "VALIDATED_ALGORITHMIC_STRATEGY" if validated else "NO_VALIDATED_ALGORITHMIC_STRATEGY"
+    payload = {"started_at": started.isoformat(), "finished_at": datetime.now(timezone.utc).isoformat(), "decision": decision, "generation": generations, "evaluated": total_evaluated, "seen_candidates": len(seen), "finalists": len(finalists), "validated_count": len(validated), "results": confirmations}
+    out = _save(payload)
     print("\n=== FINAL DECISION ===", flush=True)
     print(decision, flush=True)
-    print("Validated:", len(winners), flush=True)
-    print("Checkpoint:", _path() if False else ROOT / "experiments" / "adaptive_evolution_safe_latest.json", flush=True)
+    print("Validated:", len(validated), flush=True)
+    print("Checkpoint:", out, flush=True)
     return payload
 
 
