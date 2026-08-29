@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import time
+import zipfile
 
 import ccxt
 import pandas as pd
@@ -21,6 +26,8 @@ _TIMEFRAME_MS = {
 }
 
 _HISTORY_TARGETS = {"15m": 10_000, "1h": 5_000, "4h": 3_000}
+_VISION_BASE = "https://data.binance.vision"
+_VISION_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -61,12 +68,124 @@ class CCXTMarketData:
         last_open_ms = int(df.index[-1].timestamp() * 1000)
         return df.iloc[:-1] if now_ms - last_open_ms < interval_ms else df
 
+    @staticmethod
+    def _vision_symbol(symbol: str) -> str:
+        return symbol.replace("/", "").replace(":", "")
+
+    @staticmethod
+    def _vision_months_back(target_rows: int, timeframe: str) -> int:
+        bars_per_month = max(1, int((30 * 24 * 60 * 60 * 1000) / _TIMEFRAME_MS[timeframe]))
+        return max(3, int(target_rows / bars_per_month) + 4)
+
+    @staticmethod
+    def _vision_month_url(market_type: str, symbol: str, timeframe: str, year: int, month: int) -> str:
+        sym = CCXTMarketData._vision_symbol(symbol)
+        if market_type == "futures":
+            root = f"{_VISION_BASE}/data/futures/um/monthly/klines/{sym}/{timeframe}"
+        else:
+            root = f"{_VISION_BASE}/data/spot/monthly/klines/{sym}/{timeframe}"
+        return f"{root}/{sym}-{timeframe}-{year:04d}-{month:02d}.zip"
+
+    @staticmethod
+    def _vision_daily_url(market_type: str, symbol: str, timeframe: str, day: datetime) -> str:
+        sym = CCXTMarketData._vision_symbol(symbol)
+        if market_type == "futures":
+            root = f"{_VISION_BASE}/data/futures/um/daily/klines/{sym}/{timeframe}"
+        else:
+            root = f"{_VISION_BASE}/data/spot/daily/klines/{sym}/{timeframe}"
+        date = day.strftime("%Y-%m-%d")
+        return f"{root}/{sym}-{timeframe}-{date}.zip"
+
+    @staticmethod
+    def _download(url: str) -> bytes:
+        request = Request(url, headers={"User-Agent": "autonomous-crypto-trading-lab/1.0"})
+        with urlopen(request, timeout=_VISION_TIMEOUT_SECONDS) as response:
+            return response.read()
+
+    @classmethod
+    def _read_vision_zip(cls, payload: bytes) -> pd.DataFrame:
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            csv_names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                raise RuntimeError("Binance Vision archive contains no CSV")
+            with archive.open(csv_names[0]) as fh:
+                frame = pd.read_csv(fh, header=None)
+
+        if frame.empty:
+            raise RuntimeError("Binance Vision CSV is empty")
+        frame = frame.iloc[:, :6].copy()
+        frame.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce")
+        frame = frame.dropna(subset=["timestamp"])
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"].astype("int64"), unit="ms", utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        return frame.dropna().drop_duplicates("timestamp").set_index("timestamp").sort_index()
+
+    def _fetch_vision_history(self, symbol: str, timeframe: str, target_rows: int, market_type: str = "spot") -> pd.DataFrame:
+        if market_type == "futures" and os.getenv("ACL_VISION_FUTURES", "0") != "1":
+            raise RuntimeError("Binance Vision futures fallback disabled; use historical futures source explicitly")
+
+        now = datetime.now(timezone.utc)
+        frames: list[pd.DataFrame] = []
+        months_back = self._vision_months_back(target_rows, timeframe)
+
+        # Monthly archives are compact and deterministic. The current partial month
+        # may not be published yet, so it is filled from daily archives below.
+        year, month = now.year, now.month
+        for offset in range(months_back):
+            y, m = year, month - offset
+            while m <= 0:
+                m += 12
+                y -= 1
+            url = self._vision_month_url(market_type, symbol, timeframe, y, m)
+            try:
+                frames.append(self._read_vision_zip(self._download(url)))
+            except (HTTPError, URLError, zipfile.BadZipFile, RuntimeError, ValueError):
+                continue
+            if sum(len(x) for x in frames) >= target_rows + 2_000:
+                break
+
+        # Fill the current month from daily archives when the monthly archive is not
+        # available yet (or when we still need a few more rows).
+        if sum(len(x) for x in frames) < target_rows + 2_000:
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            for day_offset in range(now.day):
+                day = month_start.replace(hour=0) + pd.Timedelta(days=day_offset)
+                day_dt = day.to_pydatetime() if hasattr(day, "to_pydatetime") else day
+                url = self._vision_daily_url(market_type, symbol, timeframe, day_dt)
+                try:
+                    frames.append(self._read_vision_zip(self._download(url)))
+                except (HTTPError, URLError, zipfile.BadZipFile, RuntimeError, ValueError):
+                    continue
+
+        if not frames:
+            raise RuntimeError(f"Binance Vision returned no historical data for {symbol} {timeframe}")
+        df = pd.concat(frames, axis=0).sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        df = self._drop_open_candle(df, timeframe)
+        if len(df) < min(target_rows, 100):
+            raise RuntimeError(f"Insufficient Vision history for {symbol} {timeframe}: got {len(df)}, target {target_rows}")
+        return df.tail(target_rows)
+
     def fetch_ohlcv_history(self, symbol: str, timeframe: str, target_rows: int, page_limit: int = 1500,
                             market_type: str = "spot") -> pd.DataFrame:
         if timeframe not in _TIMEFRAME_MS:
             raise ValueError(f"Unsupported fixed timeframe: {timeframe}")
         if target_rows < 100:
             raise ValueError("target_rows must be at least 100")
+
+        source = os.getenv("ACL_DATA_SOURCE", "auto").lower().strip()
+        if source not in {"auto", "ccxt", "vision"}:
+            raise ValueError("ACL_DATA_SOURCE must be one of: auto, ccxt, vision")
+
+        if source in {"vision", "auto"} and self.exchange_id == "binance" and market_type == "spot":
+            try:
+                return self._fetch_vision_history(symbol, timeframe, target_rows, market_type=market_type)
+            except Exception:
+                if source == "vision":
+                    raise
+
         ex = self._exchange(market_type)
         api_symbol = self._contract_symbol(symbol) if market_type == "futures" else symbol
         interval_ms = _TIMEFRAME_MS[timeframe]
@@ -105,7 +224,9 @@ class CCXTMarketData:
         for timeframe in timeframes:
             target = _HISTORY_TARGETS.get(timeframe, limit)
             for symbol in symbols:
-                out[(symbol, timeframe)] = self.fetch_ohlcv_history(symbol, timeframe, target, page_limit=min(limit, 1500), market_type=market_type)
+                out[(symbol, timeframe)] = self.fetch_ohlcv_history(
+                    symbol, timeframe, target, page_limit=min(limit, 1500), market_type=market_type
+                )
                 time.sleep(0.05)
         return out
 
