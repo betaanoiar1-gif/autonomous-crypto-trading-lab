@@ -33,6 +33,7 @@ jobs:
         env:
           ACL_MAX_AUTONOMOUS_CYCLES: "60"
           ACL_MAX_SLOTS: "12"
+          ACL_DATA_SOURCE: "vision"
         run: python -u -m lab.orchestrator
 
       - name: Upload research results
