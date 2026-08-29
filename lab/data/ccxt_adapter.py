@@ -117,7 +117,17 @@ class CCXTMarketData:
         frame.columns = ["timestamp", "open", "high", "low", "close", "volume"]
         frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce")
         frame = frame.dropna(subset=["timestamp"])
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"].astype("int64"), unit="ms", utc=True)
+
+        # Binance Spot data uses milliseconds historically, but since 2025-01-01
+        # public spot archives use microseconds. Detect the unit from magnitude
+        # instead of assuming milliseconds for every archive.
+        sample = int(frame["timestamp"].median())
+        timestamp_unit = "us" if abs(sample) >= 100_000_000_000_000 else "ms"
+        frame["timestamp"] = pd.to_datetime(
+            frame["timestamp"].astype("int64"),
+            unit=timestamp_unit,
+            utc=True,
+        )
         for col in ["open", "high", "low", "close", "volume"]:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
         return frame.dropna().drop_duplicates("timestamp").set_index("timestamp").sort_index()
@@ -130,8 +140,6 @@ class CCXTMarketData:
         frames: list[pd.DataFrame] = []
         months_back = self._vision_months_back(target_rows, timeframe)
 
-        # Monthly archives are compact and deterministic. The current partial month
-        # may not be published yet, so it is filled from daily archives below.
         year, month = now.year, now.month
         for offset in range(months_back):
             y, m = year, month - offset
@@ -146,8 +154,6 @@ class CCXTMarketData:
             if sum(len(x) for x in frames) >= target_rows + 2_000:
                 break
 
-        # Fill the current month from daily archives when the monthly archive is not
-        # available yet (or when we still need a few more rows).
         if sum(len(x) for x in frames) < target_rows + 2_000:
             month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             for day_offset in range(now.day):
@@ -229,55 +235,3 @@ class CCXTMarketData:
                 )
                 time.sleep(0.05)
         return out
-
-    def fetch_funding_history(self, symbol: str, since_ms: int | None = None, until_ms: int | None = None,
-                              target_rows: int = 500, page_limit: int = 1000) -> pd.Series:
-        """Fetch paginated historical funding rates for a futures contract via CCXT."""
-        ex = self._exchange("futures")
-        if not ex.has.get("fetchFundingRateHistory"):
-            raise RuntimeError(f"{self.exchange_id} does not expose funding-rate history through CCXT")
-        api_symbol = self._contract_symbol(symbol)
-        collected: list[tuple[pd.Timestamp, float]] = []
-        cursor = int(since_ms) if since_ms is not None else None
-        max_pages = max(4, (target_rows // page_limit) + 8)
-        for _ in range(max_pages):
-            params = {}
-            if until_ms is not None:
-                params["until"] = int(until_ms)
-            rows = ex.fetch_funding_rate_history(api_symbol, since=cursor, limit=min(page_limit, 1000), params=params)
-            if not rows:
-                break
-            page_points = []
-            for row in rows:
-                ts = row.get("timestamp")
-                rate = row.get("fundingRate")
-                if ts is None or rate is None:
-                    continue
-                ts_i = int(ts)
-                if since_ms is not None and ts_i < since_ms:
-                    continue
-                if until_ms is not None and ts_i > until_ms:
-                    continue
-                page_points.append((pd.to_datetime(ts_i, unit="ms", utc=True), float(rate)))
-            collected.extend(page_points)
-            page_last = max((int(ts.timestamp() * 1000) for ts, _ in page_points), default=None)
-            if page_last is None:
-                break
-            if until_ms is not None and page_last >= until_ms:
-                break
-            if cursor is not None and page_last <= cursor:
-                break
-            if len(collected) >= target_rows and until_ms is None:
-                break
-            cursor = page_last + 1
-            time.sleep(0.05)
-        if not collected:
-            raise RuntimeError(f"No historical funding rates returned for {symbol}")
-        series = pd.Series(dict(collected)).sort_index()
-        if since_ms is not None:
-            series = series[series.index >= pd.to_datetime(since_ms, unit="ms", utc=True)]
-        if until_ms is not None:
-            series = series[series.index <= pd.to_datetime(until_ms, unit="ms", utc=True)]
-        if series.empty:
-            raise RuntimeError(f"Funding history for {symbol} contains no events in the requested interval")
-        return series
