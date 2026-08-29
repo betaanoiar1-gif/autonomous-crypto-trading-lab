@@ -2,10 +2,9 @@ from __future__ import annotations
 
 """AI-free bounded strategy discovery.
 
-Generates deterministic composite strategies from a safe executable DSL,
-screens them on a validation slice, then performs frozen OOS/WF/stress and
-independent-market confirmation. No LLM generation, no arbitrary code, no
-futures, and no live trading.
+Generates candidate strategies from a safe deterministic grammar, screens them
+without LLM generation, then runs frozen OOS/WF/stress checks and independent
+spot-market confirmation. Futures and live trading are intentionally disabled.
 """
 
 from dataclasses import dataclass
@@ -21,8 +20,8 @@ import numpy as np
 import pandas as pd
 
 from ..config import ROOT, load_settings
-from .run import _fetch_markets_cached
-from .evaluator import _run, _metrics
+from ..data.ccxt_adapter import CCXTMarketData
+from .evaluator import _metrics, _run
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ def _candidate_pool(seed: int, limit: int = 240) -> list[Candidate]:
         (1.0, -0.5, 1.0, 0.5, 0.5),
         (0.5, 1.0, -0.5, 1.0, 0.5),
     ]
-
     threshold_sets = [
         (1.5, 1.5, 0.25),
         (2.0, 2.0, 0.50),
@@ -69,14 +67,15 @@ def _candidate_pool(seed: int, limit: int = 240) -> list[Candidate]:
         (2.25, 1.75, 0.40),
     ]
 
-    # Seeded deterministic exploration. Each candidate is generated without
-    # observing performance, so parameters are not fitted to the final OOS set.
     attempts = 0
     while len(out) < limit and attempts < limit * 20:
         attempts += 1
         family = FAMILIES[int(rng.integers(0, len(FAMILIES)))]
         fast = int(rng.choice(fasts))
-        slow = int(rng.choice([x for x in slows if x > fast]))
+        slow_choices = [x for x in slows if x > fast]
+        if not slow_choices:
+            continue
+        slow = int(rng.choice(slow_choices))
         momentum = int(rng.choice(moms))
         breakout = int(rng.choice(brks))
         vol_window = int(rng.choice(vols))
@@ -87,7 +86,6 @@ def _candidate_pool(seed: int, limit: int = 240) -> list[Candidate]:
         long_threshold, short_threshold, exit_threshold = threshold_sets[int(rng.integers(0, len(threshold_sets)))]
         volume_mult = float(rng.choice([0.75, 0.90, 1.00, 1.10, 1.25, 1.40]))
 
-        # Give each family a slightly different compositional bias.
         if family == "trend_blend":
             weights = (max(1.0, abs(weights[0]) + 0.5), weights[1], weights[2], weights[3], weights[4])
         elif family == "momentum_blend":
@@ -116,7 +114,7 @@ def _candidate_pool(seed: int, limit: int = 240) -> list[Candidate]:
             "vol_cap": round(cap, 4),
             "volume_mult": round(volume_mult, 2),
         }
-        key = (family, tuple(sorted(params.items())))
+        key = ("invented_composite", tuple(sorted(params.items())))
         if key in seen:
             continue
         seen.add(key)
@@ -138,9 +136,11 @@ def _score(m: dict) -> float:
 
 def _frozen_eval(df: pd.DataFrame, candidate: Candidate, settings: object) -> dict:
     n = len(df)
+    if n < 400:
+        raise ValueError(f"Need at least 400 bars for discovery, got {n}")
+
     train_end = int(n * 0.55)
     valid_end = int(n * 0.70)
-    train = df.iloc[:train_end]
     valid = df.iloc[train_end:valid_end]
     holdout = df.iloc[valid_end:]
 
@@ -150,15 +150,11 @@ def _frozen_eval(df: pd.DataFrame, candidate: Candidate, settings: object) -> di
     fee = settings.execution.commission_bps
     slip = settings.execution.slippage_bps
 
-    # Fast selection slice: candidate is already frozen; this is only ranking.
     vr = _run(valid, candidate.family, p, directions, capital, fee, slip)
     vm = _metrics(vr, vr.returns)
-
-    # Final holdout: parameters remain frozen.
     hr = _run(holdout, candidate.family, p, directions, capital, fee, slip)
     hm = _metrics(hr, hr.returns)
 
-    # Frozen walk-forward on the holdout itself: no retuning.
     folds = []
     block = max(40, len(holdout) // 4)
     for i in range(4):
@@ -203,13 +199,13 @@ def _frozen_eval(df: pd.DataFrame, candidate: Candidate, settings: object) -> di
         "family": candidate.family,
         "parameters": p,
         "validation": {"metrics": vm},
-        "holdout": {k: float(hm[k]) if k not in {"trade_count"} else int(hm[k]) for k in ("total_return", "profit_factor", "max_drawdown", "sharpe", "trade_count")},
+        "holdout": {k: float(hm[k]) if k != "trade_count" else int(hm[k]) for k in ("total_return", "profit_factor", "max_drawdown", "sharpe", "trade_count")},
         "stress": {"total_return": float(sm["total_return"]), "profit_factor": float(sm["profit_factor"]), "max_drawdown": float(sm["max_drawdown"]), "trade_count": int(sm["trade_count"])},
         "walk_forward": {"folds": folds, "positive_folds": positive, "median_return": wf_median, "median_pf": wf_pf, "min_trade_count": wf_min_trades, "passed": wf_pass},
         "primary_pass": primary_pass,
         "rank_score": _score(hm) + 75.0 * wf_median + 10.0 * (1 if wf_pass else 0),
     }
-    del train, valid, holdout, vr, vm, hr, hm, stress, sm, folds
+    del valid, holdout, vr, vm, hr, hm, stress, sm
     gc.collect()
     return result
 
@@ -245,41 +241,84 @@ def _confirmation(df: pd.DataFrame, record: dict, settings: object) -> dict:
     }
 
 
+def _load_seen(path: pd.PathLike | str) -> set[tuple]:
+    path = pd.io.common.stringify_path(path)
+    p = os.fspath(path)
+    seen: set[tuple] = set()
+    if not os.path.exists(p):
+        return seen
+    with open(p, "r", encoding="utf-8") as fh:
+        for line in fh.readlines()[-5000:]:
+            try:
+                rec = json.loads(line)
+                seen.add((rec.get("family"), tuple(sorted((rec.get("parameters") or {}).items()))))
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return seen
+
+
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
 def run(hours: float = 3.0, pool_size: int = 240, finalists: int = 12) -> dict:
     settings = load_settings()
     started = datetime.now(timezone.utc)
     deadline = time.monotonic() + max(0.05, float(hours)) * 3600.0
     ledger_path = ROOT / "experiments" / "algorithmic_discovery_latest.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path = ROOT / "experiments" / "algorithmic_discovery_history.jsonl"
 
-    spot, _, _, _, snapshot = _fetch_markets_cached()
+    print("=== AI-FREE ALGORITHMIC DISCOVERY ===", flush=True)
+    print("Generator: AI disabled | Futures: DISABLED | Live trading: DISABLED", flush=True)
+    print("Primary: ETH/USDT 1h | Independent: BTC/USDT 4h", flush=True)
+    print(f"Candidate pool per batch: {pool_size} | finalists: {finalists}", flush=True)
+    print("No LLM generation. Candidates come only from the local bounded grammar.", flush=True)
+
+    # Discovery only needs spot data. Do not call the futures loader.
+    try:
+        source = os.getenv("ACL_DATA_SOURCE", "auto").lower().strip()
+        if source not in {"auto", "ccxt", "vision"}:
+            source = "auto"
+        adapter = CCXTMarketData(exchange_id="binance")
+        spot = {}
+        for symbol, timeframe, target in (
+            ("ETH/USDT", "1h", 5000),
+            ("BTC/USDT", "4h", 3000),
+        ):
+            # Respect the selected source via the existing adapter environment.
+            os.environ["ACL_DATA_SOURCE"] = source
+            spot[(symbol, timeframe)] = adapter.fetch_ohlcv_history(symbol, timeframe, target, page_limit=1500, market_type="spot")
+            print(f"Loaded {symbol} {timeframe}: {len(spot[(symbol, timeframe)])} bars", flush=True)
+    except Exception as exc:
+        payload = {
+            "started_at": started.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "decision": "DATA_ERROR",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        _save_checkpoint(ledger_path, payload)
+        print(f"DATA ERROR: {type(exc).__name__}: {exc}", flush=True)
+        return payload
+
     primary = spot[("ETH/USDT", "1h")]
     independent = spot[("BTC/USDT", "4h")]
-
-    history_path = ROOT / "experiments" / "algorithmic_discovery_history.jsonl"
-    seen: set[tuple] = set()
-    if history_path.exists():
-        for line in history_path.read_text(encoding="utf-8").splitlines()[-5000:]:
-            try:
-                rec = json.loads(line)
-                seen.add((rec.get("family"), tuple(sorted((rec.get("parameters") or {}).items()))))
-            except json.JSONDecodeError:
-                continue
-
+    seen = _load_seen(history_path)
     all_finalists: list[dict] = []
     batches = 0
     seed = int(started.timestamp())
 
-    print("=== AI-FREE ALGORITHMIC DISCOVERY ===", flush=True)
-    print("Generator: deterministic stochastic grammar | LLM: DISABLED | Futures: DISABLED | Live trading: DISABLED", flush=True)
-    print("Primary: ETH/USDT 1h | Independent: BTC/USDT 4h", flush=True)
-    print(f"Candidate pool per batch: {pool_size} | finalists per batch: {finalists}", flush=True)
-    print("Parameters are generated before validation; final OOS and confirmation are frozen.", flush=True)
-
     while time.monotonic() < deadline:
         batches += 1
-        candidates = [c for c in _candidate_pool(seed + batches, pool_size) if (c.family, tuple(sorted(c.params.items()))) not in seen]
+        candidates = [
+            c for c in _candidate_pool(seed + batches, pool_size)
+            if (c.family, tuple(sorted(c.params.items()))) not in seen
+        ]
         if not candidates:
+            print("No unseen candidates in batch; advancing seed.", flush=True)
             continue
 
         ranked: list[dict] = []
@@ -297,40 +336,41 @@ def run(hours: float = 3.0, pool_size: int = 240, finalists: int = 12) -> dict:
             gc.collect()
 
         ranked.sort(key=lambda r: r["rank_score"], reverse=True)
-        top = ranked[:finalists]
-        all_finalists.extend(top)
+        all_finalists.extend(ranked[:finalists])
         all_finalists.sort(key=lambda r: r["rank_score"], reverse=True)
         all_finalists = all_finalists[:20]
 
-        # Independent confirmation only for primary-pass finalists.
         for rec in list(all_finalists):
             if not rec.get("primary_pass") or rec.get("confirmation") is not None:
                 continue
-            conf = _confirmation(independent, rec, settings)
-            rec["confirmation"] = {**conf, "market": "BTC/USDT", "timeframe": "4h"}
-            rec["validated"] = bool(rec["primary_pass"] and conf["passed"])
-            rec["status"] = "VALIDATED" if rec["validated"] else "REJECTED"
-            with history_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+            try:
+                conf = _confirmation(independent, rec, settings)
+                rec["confirmation"] = {**conf, "market": "BTC/USDT", "timeframe": "4h"}
+                rec["validated"] = bool(rec["primary_pass"] and conf["passed"])
+                rec["status"] = "VALIDATED" if rec["validated"] else "REJECTED"
+                history_path.parent.mkdir(parents=True, exist_ok=True)
+                with history_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                if rec["validated"]:
+                    final = {
+                        "started_at": started.isoformat(),
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "duration_hours": (datetime.now(timezone.utc) - started).total_seconds() / 3600.0,
+                        "decision": "VALIDATED_ALGORITHMIC_STRATEGY",
+                        "generator": "ai_free_algorithmic_grammar",
+                        "primary_market": "ETH/USDT@1h",
+                        "independent_market": "BTC/USDT@4h",
+                        "candidate_batches": batches,
+                        "validated": [rec],
+                        "top": all_finalists[:10],
+                    }
+                    _save_checkpoint(ledger_path, final)
+                    print("=== VALIDATED ALGORITHMIC STRATEGY FOUND ===", flush=True)
+                    print(json.dumps(rec, indent=2, ensure_ascii=False, default=str), flush=True)
+                    return final
+            except Exception as exc:
+                print(f"Confirmation error: {type(exc).__name__}: {exc}", flush=True)
             gc.collect()
-            if rec["validated"]:
-                final = {
-                    "started_at": started.isoformat(),
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "duration_hours": (datetime.now(timezone.utc) - started).total_seconds() / 3600.0,
-                    "decision": "VALIDATED_ALGORITHMIC_STRATEGY",
-                    "generator": "ai_free_algorithmic_grammar",
-                    "primary_market": "ETH/USDT@1h",
-                    "independent_market": "BTC/USDT@4h",
-                    "candidate_batches": batches,
-                    "validated": [rec],
-                    "top": all_finalists[:10],
-                    "snapshot": snapshot,
-                }
-                ledger_path.write_text(json.dumps(final, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-                print("=== VALIDATED ALGORITHMIC STRATEGY FOUND ===", flush=True)
-                print(json.dumps(rec, indent=2, ensure_ascii=False, default=str), flush=True)
-                return final
 
         ledger = {
             "started_at": started.isoformat(),
@@ -340,11 +380,11 @@ def run(hours: float = 3.0, pool_size: int = 240, finalists: int = 12) -> dict:
             "generator": "ai_free_algorithmic_grammar",
             "candidate_batches": batches,
             "pool_size": pool_size,
+            "screened_count": len(seen),
             "screened_top": all_finalists[:10],
-            "snapshot": snapshot,
         }
-        ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        print(f"=== BATCH {batches} COMPLETE | top_score={all_finalists[0]['rank_score'] if all_finalists else 0:.2f} ===", flush=True)
+        _save_checkpoint(ledger_path, ledger)
+        print(f"=== BATCH {batches} COMPLETE | screened={len(seen)} | top_score={all_finalists[0]['rank_score'] if all_finalists else 0:.2f} ===", flush=True)
 
     final = {
         "started_at": started.isoformat(),
@@ -355,9 +395,8 @@ def run(hours: float = 3.0, pool_size: int = 240, finalists: int = 12) -> dict:
         "candidate_batches": batches,
         "screened_count": len(seen),
         "top": all_finalists[:10],
-        "snapshot": snapshot,
     }
-    ledger_path.write_text(json.dumps(final, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    _save_checkpoint(ledger_path, final)
     print("=== ALGORITHMIC DISCOVERY FINISHED ===", flush=True)
     print("Decision:", final["decision"], flush=True)
     print("Batches:", batches, "| Unique candidates seen:", len(seen), flush=True)
@@ -366,4 +405,8 @@ def run(hours: float = 3.0, pool_size: int = 240, finalists: int = 12) -> dict:
 
 
 if __name__ == "__main__":
-    run(hours=float(os.getenv("ACL_DISCOVERY_HOURS", "3")))
+    try:
+        run(hours=float(os.getenv("ACL_DISCOVERY_HOURS", "3")))
+    except Exception as exc:
+        print(f"FATAL: {type(exc).__name__}: {exc}", flush=True)
+        raise
