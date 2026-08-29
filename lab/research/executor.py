@@ -92,9 +92,13 @@ def compile_signal(df: pd.DataFrame, family: str, params: dict, directions: list
             (df["high"].astype(float) - prev_close).abs(),
             (df["low"].astype(float) - prev_close).abs(),
         ], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1 / n, adjust=False).mean()
-        upper = prev_close + mult * atr
-        lower = prev_close - mult * atr
+        # A decision for bar t must only use information available before bar t.
+        # The previous version included bar t's range in ATR, which introduces
+        # lookahead leakage. Shift ATR by one bar before building the threshold.
+        atr = tr.ewm(alpha=1 / n, adjust=False).mean().shift(1)
+        signal_base = prev_close
+        upper = signal_base + mult * atr
+        lower = signal_base - mult * atr
         sig = pd.Series(0.0, index=df.index)
         sig[close > upper] = 1.0
         if allow_short:
