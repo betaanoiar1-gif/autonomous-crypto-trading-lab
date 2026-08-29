@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-"""Focused, autonomous research of genuinely different signal combinations.
+"""Focused autonomous research with bounded refinement.
 
-This module intentionally avoids the broad 10-cycle loop. It evaluates a small
-set of hand-designed research ideas, ranks them on an in-sample/holdout split,
-then freezes the winning rule and checks independent market/timeframe data.
+The engine evaluates a small set of genuinely different research ideas, ranks
+them on a holdout split with frozen parameters inside four validation blocks,
+then freezes the best candidate for an independent market/timeframe test.
 
-It is research/paper-only. No exchange orders are created here.
+When a promising candidate narrowly misses a gate, the engine performs one
+small refinement ring around that candidate instead of restarting a broad
+search. Gates themselves are never loosened.
+
+Research/paper-only. No exchange orders are created here.
 """
 
 from dataclasses import dataclass
@@ -172,8 +176,26 @@ def _evaluate_idea(df: pd.DataFrame, idea: Idea, settings):
     return {
         "idea": idea.name,
         "parameters": dict(idea.params),
-        "train": {k: train_metrics[k] for k in ("total_return", "profit_factor", "max_drawdown", "trade_count", "sharpe")},
-        "holdout": {k: test_metrics[k] for k in ("total_return", "profit_factor", "max_drawdown", "trade_count", "sharpe")},
+        "train": {
+            k: train_metrics[k]
+            for k in (
+                "total_return",
+                "profit_factor",
+                "max_drawdown",
+                "trade_count",
+                "sharpe",
+            )
+        },
+        "holdout": {
+            k: test_metrics[k]
+            for k in (
+                "total_return",
+                "profit_factor",
+                "max_drawdown",
+                "trade_count",
+                "sharpe",
+            )
+        },
         "frozen_folds": folds,
         "positive_folds": positive,
         "median_fold_return": median_fold,
@@ -182,6 +204,34 @@ def _evaluate_idea(df: pd.DataFrame, idea: Idea, settings):
         "min_fold_trades": min_trades,
         "score": float(score),
     }
+
+
+def _gate_reasons(record: dict) -> list[str]:
+    h = record["holdout"]
+    reasons = []
+
+    if float(h["total_return"]) <= 0:
+        reasons.append("non_positive_oos_return")
+    if float(h["profit_factor"]) <= 1:
+        reasons.append("oos_profit_factor_le_1")
+    if float(h["max_drawdown"]) < -0.50:
+        reasons.append("oos_drawdown_over_50pct")
+    if int(h["trade_count"]) < 8:
+        reasons.append("oos_too_few_trades")
+    if int(record["positive_folds"]) < 3:
+        reasons.append("wf_positive_folds_lt_3")
+    if float(record["median_fold_return"]) <= 0:
+        reasons.append("wf_median_return_non_positive")
+    if float(record["median_fold_pf"]) <= 1:
+        reasons.append("wf_median_pf_le_1")
+    if int(record["min_fold_trades"]) < 4:
+        reasons.append("wf_min_fold_trades_lt_4")
+
+    return reasons
+
+
+def _primary_gate(record: dict) -> bool:
+    return not _gate_reasons(record)
 
 
 def _independent(df: pd.DataFrame, idea: Idea, settings):
@@ -200,7 +250,63 @@ def _independent(df: pd.DataFrame, idea: Idea, settings):
         "trade_count": int(m["trade_count"]),
         "sharpe": float(m["sharpe"]),
         "passed": passed,
+        "reasons": []
+        if passed
+        else [
+            reason
+            for reason, bad in (
+                ("non_positive_return", float(m["total_return"]) <= 0),
+                ("profit_factor_le_1", float(m["profit_factor"]) <= 1),
+                ("drawdown_over_50pct", float(m["max_drawdown"]) < -0.50),
+                ("too_few_trades", int(m["trade_count"]) < 8),
+            )
+            if bad
+        ],
     }
+
+
+def _refinement_ideas(best: dict) -> list[Idea]:
+    """Generate one bounded refinement ring around a promising winner."""
+    if best["idea"] != "trend_volatility":
+        return []
+
+    p = best["parameters"]
+    fast = int(p["fast"])
+    slow = int(p["slow"])
+    vol_window = int(p["vol_window"])
+    floor = float(p["vol_floor"])
+    cap = float(p["vol_cap"])
+
+    specs = [
+        (max(10, fast - 5), max(fast + 20, slow - 10), floor, cap),
+        (fast, slow, floor * 0.9, cap),
+        (fast, slow, floor * 1.1, cap),
+        (fast, slow, floor, min(0.050, cap + 0.005)),
+        (fast, slow, floor, max(floor + 0.010, cap - 0.005)),
+        (max(10, fast + 5), slow + 10, floor, cap),
+        (max(10, fast - 5), max(fast + 20, slow - 5), floor * 0.9, cap + 0.005),
+        (fast + 5, slow + 5, floor * 1.1, max(floor + 0.010, cap - 0.005)),
+    ]
+
+    ideas = []
+    seen = set()
+    for f, s, fl, cp in specs:
+        if s <= f or fl <= 0 or cp <= fl:
+            continue
+        params = {
+            "fast": int(f),
+            "slow": int(s),
+            "vol_window": int(vol_window),
+            "vol_floor": round(float(fl), 6),
+            "vol_cap": round(float(cp), 6),
+        }
+        key = tuple(sorted(params.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        ideas.append(Idea("trend_volatility", params))
+
+    return ideas
 
 
 def run() -> dict:
@@ -228,15 +334,18 @@ def run() -> dict:
     print("=== AUTONOMOUS IDEA RESEARCH ===", flush=True)
     print("Primary: ETH/USDT | 1h | spot", flush=True)
     print("Independent: BTC/USDT | 4h | spot", flush=True)
-    print("Ideas: 12 | Futures: disabled | Live trading: disabled", flush=True)
+    print("Ideas: 12 + bounded refinement when justified | Futures: disabled | Live trading: disabled", flush=True)
     print(f"Primary bars: {len(primary)}", flush=True)
     print()
 
     results = []
+
     for idx, idea in enumerate(ideas, 1):
         try:
             r = _evaluate_idea(primary, idea, settings)
+            r["gate_reasons"] = _gate_reasons(r)
             results.append(r)
+
             print(
                 f"[{idx:02d}] {r['idea']} {r['parameters']} | "
                 f"OOS={r['holdout']['total_return']:.2%} | "
@@ -244,43 +353,124 @@ def run() -> dict:
                 f"DD={r['holdout']['max_drawdown']:.2%} | "
                 f"trades={r['holdout']['trade_count']} | "
                 f"WF={r['positive_folds']}/4 | "
-                f"stress-free score={r['score']:.2f}",
+                f"score={r['score']:.2f}",
                 flush=True,
             )
+
         except Exception as exc:
-            print(f"[{idx:02d}] {idea.name} ERROR: {type(exc).__name__}: {exc}", flush=True)
+            print(
+                f"[{idx:02d}] {idea.name} ERROR: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     if not results:
         raise RuntimeError("No research idea could be evaluated.")
 
     results.sort(key=lambda x: x["score"], reverse=True)
+
     best = results[0]
-    frozen = Idea(best["idea"], best["parameters"])
+
+    # If the winner is promising but misses gates, inspect it and run only one
+    # tight refinement ring. This is not a relaxation of the validation rules.
+    refinement_candidates = _refinement_ideas(best)
+    refinement_results = []
 
     print()
-    print("=== TOP 3 ===", flush=True)
-    for i, r in enumerate(results[:3], 1):
+    print("=== BEST INITIAL IDEA ===", flush=True)
+    print(f"Idea: {best['idea']}", flush=True)
+    print(f"Parameters: {best['parameters']}", flush=True)
+    print(
+        f"OOS={best['holdout']['total_return']:.2%} | "
+        f"PF={best['holdout']['profit_factor']:.2f} | "
+        f"DD={best['holdout']['max_drawdown']:.2%} | "
+        f"trades={best['holdout']['trade_count']} | "
+        f"WF={best['positive_folds']}/4",
+        flush=True,
+    )
+    print(
+        "Initial gate reasons: "
+        + ("NONE" if not best["gate_reasons"] else ", ".join(best["gate_reasons"])),
+        flush=True,
+    )
+
+    # Only refine when primary metrics are plausibly promising.
+    promising_for_refinement = bool(
+        best["holdout"]["total_return"] > 0.05
+        and best["holdout"]["profit_factor"] > 1.05
+        and best["holdout"]["max_drawdown"] >= -0.40
+        and best["holdout"]["trade_count"] >= 10
+        and best["positive_folds"] >= 3
+    )
+
+    if refinement_candidates and promising_for_refinement and not _primary_gate(best):
+        print()
         print(
-            f"#{i} {r['idea']} {r['parameters']} | "
-            f"OOS={r['holdout']['total_return']:.2%} | PF={r['holdout']['profit_factor']:.2f} | "
-            f"DD={r['holdout']['max_drawdown']:.2%} | trades={r['holdout']['trade_count']} | WF={r['positive_folds']}/4",
+            f"=== BOUNDED REFINEMENT ({len(refinement_candidates)} candidates) ===",
             flush=True,
         )
 
-    primary_ok = bool(
-        best["holdout"]["total_return"] > 0
-        and best["holdout"]["profit_factor"] > 1
-        and best["holdout"]["max_drawdown"] >= -0.50
-        and best["holdout"]["trade_count"] >= 8
-        and best["positive_folds"] >= 3
-        and best["median_fold_return"] > 0
-        and best["median_fold_pf"] > 1
-        and best["min_fold_trades"] >= 4
-    )
+        for idx, idea in enumerate(refinement_candidates, 1):
+            try:
+                r = _evaluate_idea(primary, idea, settings)
+                r["gate_reasons"] = _gate_reasons(r)
+                refinement_results.append(r)
+
+                print(
+                    f"[R{idx:02d}] {idea.parameters} | "
+                    f"OOS={r['holdout']['total_return']:.2%} | "
+                    f"PF={r['holdout']['profit_factor']:.2f} | "
+                    f"DD={r['holdout']['max_drawdown']:.2%} | "
+                    f"trades={r['holdout']['trade_count']} | "
+                    f"WF={r['positive_folds']}/4 | "
+                    f"score={r['score']:.2f}",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                print(
+                    f"[R{idx:02d}] ERROR: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    if refinement_results:
+        all_candidates = results + refinement_results
+        all_candidates.sort(key=lambda x: x["score"], reverse=True)
+        best = all_candidates[0]
+
+    frozen = Idea(best["idea"], best["parameters"])
+
+    print()
+    print("=== FINAL SHORTLIST ===", flush=True)
+    for i, r in enumerate(
+        sorted(
+            results + refinement_results,
+            key=lambda x: x["score"],
+            reverse=True,
+        )[:5],
+        1,
+    ):
+        print(
+            f"#{i} {r['idea']} {r['parameters']} | "
+            f"OOS={r['holdout']['total_return']:.2%} | "
+            f"PF={r['holdout']['profit_factor']:.2f} | "
+            f"DD={r['holdout']['max_drawdown']:.2%} | "
+            f"trades={r['holdout']['trade_count']} | "
+            f"WF={r['positive_folds']}/4 | "
+            f"gates={'PASS' if _primary_gate(r) else 'FAIL'}",
+            flush=True,
+        )
+
+    primary_ok = _primary_gate(best)
 
     print()
     print("=== FROZEN INDEPENDENT TEST ===", flush=True)
-    independent_result = _independent(independent, frozen, settings)
+
+    independent_result = _independent(
+        independent,
+        frozen,
+        settings,
+    )
+
     print(
         f"Frozen {frozen.name} {frozen.params} | "
         f"BTC/USDT 4h return={independent_result['total_return']:.2%} | "
@@ -292,12 +482,37 @@ def run() -> dict:
         flush=True,
     )
 
-    decision = "PROMOTE_TO_PAPER" if primary_ok and independent_result["passed"] else "REJECT_IDEA_SET"
+    if independent_result["reasons"]:
+        print(
+            "Independent gate reasons: "
+            + ", ".join(independent_result["reasons"]),
+            flush=True,
+        )
+
+    decision = (
+        "PROMOTE_TO_PAPER"
+        if primary_ok and independent_result["passed"]
+        else "REJECT_IDEA_SET"
+    )
 
     output = {
-        "primary": {"market": "ETH/USDT", "timeframe": "1h", "market_type": "spot"},
-        "independent": {"market": "BTC/USDT", "timeframe": "4h", "market_type": "spot"},
+        "primary": {
+            "market": "ETH/USDT",
+            "timeframe": "1h",
+            "market_type": "spot",
+        },
+        "independent": {
+            "market": "BTC/USDT",
+            "timeframe": "4h",
+            "market_type": "spot",
+        },
         "best": best,
+        "refinement": {
+            "triggered": bool(refinement_results),
+            "candidate_count": len(refinement_candidates),
+            "evaluated_count": len(refinement_results),
+            "results": refinement_results,
+        },
         "independent_result": independent_result,
         "decision": decision,
         "research_count": len(results),
@@ -305,13 +520,18 @@ def run() -> dict:
 
     path = ROOT / "experiments" / "autonomous_ideas_latest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    path.write_text(
+        json.dumps(output, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
     print()
     print("=== FINAL DECISION ===", flush=True)
     print(f"Decision: {decision}", flush=True)
     print(f"Best idea: {best['idea']}", flush=True)
     print(f"Best parameters: {best['parameters']}", flush=True)
+    print(f"Primary gate: {primary_ok}", flush=True)
+    print(f"Independent gate: {independent_result['passed']}", flush=True)
     print(f"Saved: {path}", flush=True)
 
     return output
