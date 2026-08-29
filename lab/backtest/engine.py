@@ -51,7 +51,13 @@ def run_ohlcv(df: pd.DataFrame, signal: pd.Series, initial_capital: float, fee_b
     market_type = str(market_type).strip().lower()
     leverage = float(leverage)
     data = df.copy().sort_index(); close = data["close"].astype(float); high = data["high"].astype(float); low = data["low"].astype(float)
-    pos = signal.astype(float).reindex(close.index).fillna(0.0).clip(-1.0, 1.0); next_pos = pos.shift(1).fillna(0.0)
+    if market_type == "spot":
+        # Spot research is intentionally long/flat. Negative positions are invalid
+        # and must never enter the evaluator even if an upstream signal misbehaves.
+        pos = signal.astype(float).reindex(close.index).fillna(0.0).clip(0.0, 1.0)
+    else:
+        pos = signal.astype(float).reindex(close.index).fillna(0.0).clip(-1.0, 1.0)
+    next_pos = pos.shift(1).fillna(0.0)
     asset_ret = close.pct_change().fillna(0.0); turnover = pos.diff().abs().fillna(pos.abs()); effective_leverage = leverage if market_type == "futures" else 1.0
     cost_rate = (fee_bps + slippage_bps) / 10000.0; trading_costs = turnover * cost_rate; gross_strategy_ret = next_pos * effective_leverage * asset_ret
     actual_funding, funding_events = _align_funding_rates(data.index, funding_rates)
